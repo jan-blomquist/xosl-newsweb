@@ -1,0 +1,9 @@
+[package]
+name = "xosl-newsweb"
+description = "Self-hosted mirror of Oslo Børs NewsWeb: company disclosures and their attachments, served over gRPC. Unofficial."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true

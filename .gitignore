@@ -1,0 +1,11 @@
+/target/
+
+# viz-shell's state: caches and shell history, per repository.
+/.vz_state/
+
+# Env files hold secrets.
+/.env
+
+# IDE folders and local agent settings.
+/.idea/
+/.claude/
