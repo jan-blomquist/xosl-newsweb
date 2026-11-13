@@ -1,0 +1,21 @@
+# The dev shell, for viz-shell (https://github.com/jan-blomquist/viz-shell)
+# 0.1.0 or later: `vz new` opens it, `vz -- just check` runs one command in it.
+# It carries the toolchain and nothing else: no docker, no sudo, no host
+# network, no agent. Optional: `cargo` on the host works as well (README).
+name: default
+extends: vz-debian-trixie
+image: { dockerfile: Dockerfile }
+shell: fish
+
+banner: |2
+                                        _
+   _ __   _____      _______      _____| |__
+  | '_ \ / _ \ \ /\ / / __\ \ /\ / / _ \ '_ \
+  | | | |  __/\ V  V /\__ \\ V  V /  __/ |_) |
+  |_| |_|\___| \_/\_/ |___/ \_/\_/ \___|_.__/
+
+# Kept in .vz_state/, per repository; nothing comes from the host's home.
+state:
+  - /usr/local/cargo/registry
+  - /usr/local/cargo/git
+  - ~/.local/share/fish

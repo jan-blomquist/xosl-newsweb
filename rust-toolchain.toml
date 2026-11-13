@@ -1,0 +1,4 @@
+# The one source of the Rust version: CI and local builds both read it.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
