@@ -41,11 +41,10 @@ pub struct Disclosure {
     /// time are set, body and attachments are not yet.
     #[prost(bool, tag="11")]
     pub read_in_full: bool,
-    /// The exchange's category ids, as plain numbers. The exchange sends a
-    /// list; in practice it holds exactly one. An id the exchange adds later
-    /// arrives here unchanged.
-    #[prost(int32, repeated, tag="12")]
-    pub category_ids: ::prost::alloc::vec::Vec<i32>,
+    /// The exchange's categories for the disclosure. The exchange sends a list;
+    /// in practice it holds exactly one.
+    #[prost(message, repeated, tag="12")]
+    pub categories: ::prost::alloc::vec::Vec<Category>,
     #[prost(message, repeated, tag="13")]
     pub attachments: ::prost::alloc::vec::Vec<Attachment>,
     /// Regulatory flags, as the exchange states them. False until the
@@ -66,6 +65,25 @@ pub struct Disclosure {
     /// names this one.
     #[prost(int64, tag="18")]
     pub corrected_by_message_id: i64,
+    /// The mirror could not read the disclosure in full and will not try again:
+    /// the exchange answered that it does not exist, several times. Only the
+    /// fields of the exchange's list are set.
+    #[prost(bool, tag="19")]
+    pub read_failed: bool,
+}
+/// A category as the exchange names it. The mirror keeps no list of
+/// categories: the id and both names come with each disclosure, so a category
+/// the exchange adds later arrives here unchanged.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Category {
+    #[prost(int32, tag="1")]
+    pub id: i32,
+    /// The Norwegian name, in the exchange's capitals: "HALVÅRSRAPPORT".
+    #[prost(string, tag="2")]
+    pub name_no: ::prost::alloc::string::String,
+    /// The English name: "HALF YEAR FINANCIAL REPORT".
+    #[prost(string, tag="3")]
+    pub name_en: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Issuer {
@@ -211,6 +229,156 @@ pub mod event {
         }
     }
 }
+/// What the mirror holds and how its ingest is doing, at one instant.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Status {
+    /// The version of the mirror.
+    #[prost(string, tag="1")]
+    pub version: ::prost::alloc::string::String,
+    /// False: the mirror serves what it holds and sends the exchange no
+    /// request. `jobs` is then empty.
+    #[prost(bool, tag="2")]
+    pub ingest_enabled: bool,
+    #[prost(message, repeated, tag="3")]
+    pub jobs: ::prost::alloc::vec::Vec<JobStatus>,
+    #[prost(message, optional, tag="4")]
+    pub coverage: ::core::option::Option<Coverage>,
+    #[prost(message, optional, tag="5")]
+    pub counts: ::core::option::Option<Counts>,
+    /// The `seq` of the newest event; 0 when there is none.
+    #[prost(int64, tag="6")]
+    pub latest_seq: i64,
+}
+/// One ingest job since the mirror started. A time is 0 until it has
+/// happened.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JobStatus {
+    /// "poller", "backfiller", "reader" or "downloader".
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    /// When the job last finished a round of work, with or without success.
+    #[prost(int64, tag="2")]
+    pub last_pass_ended_at_ns: i64,
+    /// When the job last succeeded: a day listed, a disclosure read in full,
+    /// an attachment stored.
+    #[prost(int64, tag="3")]
+    pub last_success_at_ns: i64,
+    #[prost(int64, tag="4")]
+    pub last_failure_at_ns: i64,
+    /// The latest failure, in words; empty when there has been none.
+    #[prost(string, tag="5")]
+    pub last_failure: ::prost::alloc::string::String,
+}
+/// Which past days the mirror knows to be complete. A day is an Oslo calendar
+/// day, written `YYYY-MM-DD`. The range starts `lookback_days` before today
+/// and ends yesterday; the mirror makes no statement about earlier days.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Coverage {
+    #[prost(string, tag="1")]
+    pub first_day: ::prost::alloc::string::String,
+    #[prost(int32, tag="2")]
+    pub lookback_days: i32,
+    /// The days known to be complete, in ascending order.
+    #[prost(message, repeated, tag="3")]
+    pub sealed: ::prost::alloc::vec::Vec<DayRange>,
+    /// The days not known to be complete, in ascending order.
+    #[prost(message, repeated, tag="4")]
+    pub gaps: ::prost::alloc::vec::Vec<DayRange>,
+    /// The number of days in `gaps`.
+    #[prost(int32, tag="5")]
+    pub gap_days: i32,
+}
+/// Consecutive days, both included.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DayRange {
+    #[prost(string, tag="1")]
+    pub first: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub last: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Counts {
+    #[prost(int64, tag="1")]
+    pub disclosures: i64,
+    /// Disclosures waiting to be read in full.
+    #[prost(int64, tag="2")]
+    pub disclosures_unread: i64,
+    /// Disclosures with `read_failed` set.
+    #[prost(int64, tag="3")]
+    pub disclosures_failed: i64,
+    #[prost(int64, tag="4")]
+    pub attachments_pending: i64,
+    #[prost(int64, tag="5")]
+    pub attachments_stored: i64,
+    #[prost(int64, tag="6")]
+    pub attachments_failed: i64,
+}
+/// One failed attempt to list a day, read a disclosure in full or download
+/// an attachment. Successes are not logged.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Failure {
+    /// Increases with every failure; never reused.
+    #[prost(int64, tag="1")]
+    pub id: i64,
+    #[prost(int64, tag="2")]
+    pub at_ns: i64,
+    #[prost(enumeration="failure::Stage", tag="3")]
+    pub stage: i32,
+    /// A retry cannot change the result: the exchange answered that the
+    /// disclosure or the attachment does not exist.
+    #[prost(bool, tag="4")]
+    pub permanent: bool,
+    /// 0 for `STAGE_LIST`.
+    #[prost(int64, tag="5")]
+    pub message_id: i64,
+    /// 0 unless `STAGE_ATTACHMENT`.
+    #[prost(int64, tag="6")]
+    pub attachment_id: i64,
+    /// The day listed, `YYYY-MM-DD`, for `STAGE_LIST`; empty otherwise.
+    #[prost(string, tag="7")]
+    pub day: ::prost::alloc::string::String,
+    /// The failure, in words.
+    #[prost(string, tag="8")]
+    pub detail: ::prost::alloc::string::String,
+}
+/// Nested message and enum types in `Failure`.
+pub mod failure {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum Stage {
+        Unspecified = 0,
+        /// Listing one day.
+        List = 1,
+        /// Reading one disclosure in full.
+        Read = 2,
+        /// Downloading one attachment.
+        Attachment = 3,
+    }
+    impl Stage {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Unspecified => "STAGE_UNSPECIFIED",
+                Self::List => "STAGE_LIST",
+                Self::Read => "STAGE_READ",
+                Self::Attachment => "STAGE_ATTACHMENT",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "STAGE_UNSPECIFIED" => Some(Self::Unspecified),
+                "STAGE_LIST" => Some(Self::List),
+                "STAGE_READ" => Some(Self::Read),
+                "STAGE_ATTACHMENT" => Some(Self::Attachment),
+                _ => None,
+            }
+        }
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DisclosureFilter {
     /// Published at or after this time; 0 is unbounded.
@@ -269,6 +437,26 @@ pub struct WatchEventsRequest {
 pub struct WatchEventsResponse {
     #[prost(message, optional, tag="1")]
     pub event: ::core::option::Option<Event>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetStatusRequest {
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetStatusResponse {
+    #[prost(message, optional, tag="1")]
+    pub status: ::core::option::Option<Status>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListFailuresRequest {
+    /// Only the failures of this disclosure and its attachments; 0 is every
+    /// failure.
+    #[prost(int64, tag="1")]
+    pub message_id: i64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListFailuresResponse {
+    #[prost(message, optional, tag="1")]
+    pub failure: ::core::option::Option<Failure>,
 }
 include!("com.vizroy.xosl.newsweb.v1.serde.rs");
 include!("com.vizroy.xosl.newsweb.v1.tonic.rs");

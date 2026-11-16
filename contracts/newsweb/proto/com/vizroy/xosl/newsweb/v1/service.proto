@@ -4,6 +4,7 @@ package com.vizroy.xosl.newsweb.v1;
 
 import "com/vizroy/xosl/newsweb/v1/event.proto";
 import "com/vizroy/xosl/newsweb/v1/model.proto";
+import "com/vizroy/xosl/newsweb/v1/status.proto";
 
 // Everything the mirror serves.
 service NewswebService {
@@ -26,6 +27,13 @@ service NewswebService {
   // sends each new event as it is written. OUT_OF_RANGE when `since_seq` is
   // greater than the latest event's `seq`.
   rpc WatchEvents(WatchEventsRequest) returns (stream WatchEventsResponse);
+
+  // What the mirror holds and how its ingest is doing.
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+
+  // Streams the failure log, newest first. There is no row limit; cancel
+  // the call when enough has arrived.
+  rpc ListFailures(ListFailuresRequest) returns (stream ListFailuresResponse);
 }
 
 message DisclosureFilter {
@@ -73,4 +81,20 @@ message WatchEventsRequest {
 
 message WatchEventsResponse {
   Event event = 1;
+}
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  Status status = 1;
+}
+
+message ListFailuresRequest {
+  // Only the failures of this disclosure and its attachments; 0 is every
+  // failure.
+  int64 message_id = 1;
+}
+
+message ListFailuresResponse {
+  Failure failure = 1;
 }

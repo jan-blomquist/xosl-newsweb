@@ -14,10 +14,10 @@ general meetings. It is a website made for reading one disclosure at a time.
 Analysis needs something else: every disclosure of one company, everything
 published last night, the PDFs themselves, and a way to hear about a new
 disclosure the moment it appears. `xosl-newsweb` keeps your own copy, and its
-gRPC interface will answer those questions from it, so your programs talk to
+gRPC interface answers those questions from it, so your programs talk to
 your mirror and not to the exchange.
 
-## What it will do
+## What it does
 
 One binary and one data folder. There is no database server to run and
 nothing else to install:
@@ -25,22 +25,19 @@ nothing else to install:
 - **Poll** NewsWeb for new disclosures and store each one, with its metadata,
   in an embedded SQLite database.
 - **Download** each disclosure's attachments (mostly PDFs) as files beside the
-  database, or into an S3-compatible bucket if you prefer one.
+  database.
 - **Backfill** earlier days on request, newest first, as far back as you ask.
 - **Serve** it all over gRPC: list and fetch disclosures, read attachments,
   and follow a stream of events that tells a consumer what is new and lets it
   resume where it left off.
 - **Report** on itself: what it holds, how far behind it is, what failed.
 
-The same binary will carry a command-line client for those calls, for people
-and for scripts.
-
-gRPC will be the only interface. The database schema and the file layout are
+gRPC is the only interface. The database schema and the file layout are
 internal and can change between versions, so no other program should read
 them directly.
 
-Polling, backfill and download exist; the gRPC server, the command-line client
-and the report do not exist yet.
+A command-line client for those calls, in the same binary, does not exist
+yet.
 
 ## Running
 
@@ -64,6 +61,7 @@ lists them.
 | `--request-interval-ms <N>` | `XOSL_NEWSWEB_REQUEST_INTERVAL_MS` | `1000` | The shortest time between two requests to the exchange; at least 1000. |
 | `--poll-interval-secs <N>` | `XOSL_NEWSWEB_POLL_INTERVAL_SECS` | `60` | How often today is listed; at least 1. |
 | `--lookback-days <N>` | `XOSL_NEWSWEB_LOOKBACK_DAYS` | `7` | How many past days are kept complete; at least 1. |
+| `--listen <ADDRESS>` | `XOSL_NEWSWEB_LISTEN` | `127.0.0.1:50051` | The address of the gRPC server. In a container, listen on `0.0.0.0:50051`. |
 | `--log-format <FORMAT>` | `XOSL_NEWSWEB_LOG_FORMAT` | `text` | How log lines are written: `text` or `json`. |
 
 Days are Oslo calendar days. A past day is complete once a listing of it,
@@ -79,6 +77,35 @@ The data folder holds:
 Out of scope: search, text extraction, classification and anything else
 derived from the disclosures. Those belong in the programs that consume the
 mirror.
+
+### Health
+
+`run` starts a gRPC server on the `--listen` address, with or without
+`--ingest`. Beside the mirror's own service it serves the standard
+`grpc.health.v1.Health` service.
+
+The mirror is healthy when ingest is off, or when the poller listed today
+successfully within the last 10 minutes or three poll intervals, whichever is
+longer. Before the first listing, the time counts from start-up, so a mirror
+that has just started is healthy until that limit passes. A failed read or
+download, a gap being backfilled and a day without disclosures do not make it
+unhealthy. The status is re-evaluated every 10 seconds, and a change is
+logged: `info` when it becomes healthy, `error` with the reason when it
+becomes unhealthy.
+
+`xosl-newsweb health` asks the server for its status and prints one line:
+`healthy` (exit code 0), `unhealthy` (exit code 1), or `unreachable: <cause>`
+(exit code 1) when the call fails within 5 seconds. `--address <ADDRESS>`
+(`XOSL_NEWSWEB_HEALTH_ADDRESS`, default `http://127.0.0.1:50051`) names the
+server. The release image has no shell and no curl, so Docker Compose runs
+the binary itself:
+
+```yaml
+healthcheck:
+  test: ["CMD", "/xosl-newsweb", "health"]
+  interval: 30s
+  start_period: 60s
+```
 
 ## Logging
 
@@ -113,6 +140,8 @@ One service, `NewswebService`:
 | `GetDisclosure` | Returns one disclosure by its NewsWeb message id, the number in its address. |
 | `ReadAttachment` | Streams an attachment's bytes. |
 | `WatchEvents` | Replays what changed since a point the caller names, then follows new events live. |
+| `GetStatus` | Returns what the mirror holds, which days it knows to be complete, and how each ingest job is doing. |
+| `ListFailures` | Streams the log of failed attempts, newest first, for everything or for one disclosure. |
 
 Any gRPC client can be generated from those files. The Rust code generated
 from them is committed under `src/gen`.

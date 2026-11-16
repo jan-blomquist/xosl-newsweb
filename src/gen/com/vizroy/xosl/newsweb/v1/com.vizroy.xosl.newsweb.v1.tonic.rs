@@ -206,6 +206,64 @@ pub mod newsweb_service_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
+        pub async fn get_status(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetStatusResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/com.vizroy.xosl.newsweb.v1.NewswebService/GetStatus",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "com.vizroy.xosl.newsweb.v1.NewswebService",
+                        "GetStatus",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn list_failures(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListFailuresRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::ListFailuresResponse>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/com.vizroy.xosl.newsweb.v1.NewswebService/ListFailures",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "com.vizroy.xosl.newsweb.v1.NewswebService",
+                        "ListFailures",
+                    ),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -265,6 +323,26 @@ pub mod newsweb_service_server {
             request: tonic::Request<super::WatchEventsRequest>,
         ) -> std::result::Result<
             tonic::Response<Self::WatchEventsStream>,
+            tonic::Status,
+        >;
+        async fn get_status(
+            &self,
+            request: tonic::Request<super::GetStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetStatusResponse>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the ListFailures method.
+        type ListFailuresStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::ListFailuresResponse, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn list_failures(
+            &self,
+            request: tonic::Request<super::ListFailuresRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::ListFailuresStream>,
             tonic::Status,
         >;
     }
@@ -515,6 +593,97 @@ pub mod newsweb_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = WatchEventsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/com.vizroy.xosl.newsweb.v1.NewswebService/GetStatus" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetStatusSvc<T: NewswebService>(pub Arc<T>);
+                    impl<
+                        T: NewswebService,
+                    > tonic::server::UnaryService<super::GetStatusRequest>
+                    for GetStatusSvc<T> {
+                        type Response = super::GetStatusResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetStatusRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NewswebService>::get_status(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetStatusSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/com.vizroy.xosl.newsweb.v1.NewswebService/ListFailures" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListFailuresSvc<T: NewswebService>(pub Arc<T>);
+                    impl<
+                        T: NewswebService,
+                    > tonic::server::ServerStreamingService<super::ListFailuresRequest>
+                    for ListFailuresSvc<T> {
+                        type Response = super::ListFailuresResponse;
+                        type ResponseStream = T::ListFailuresStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListFailuresRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as NewswebService>::list_failures(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListFailuresSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

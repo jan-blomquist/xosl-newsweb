@@ -7,6 +7,10 @@
 //! transaction.
 //!
 //! The store reads no clock: callers pass the current time.
+//!
+//! The `seq` of the newest event is also kept in a `watch` channel, set after
+//! each transaction that wrote an event commits, so a reader waits for new
+//! events without polling.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -16,6 +20,7 @@ use jiff::civil::Date;
 use prost::Message;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{SqliteConnection, SqlitePool};
+use tokio::sync::watch;
 
 use crate::exchange::{self, DecodeError, Fetched};
 use crate::pb::{Attachment, Disclosure, DisclosureFilter, Event, attachment, event};
@@ -119,6 +124,20 @@ pub struct QueueSizes {
     pub failed_attachments: i64,
 }
 
+/// How many disclosures and attachments the store holds, by state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, sqlx::FromRow)]
+pub struct Counts {
+    /// Every stored disclosure, test disclosures included.
+    pub disclosures: i64,
+    /// Disclosures to read in full, whatever their next try's time.
+    pub disclosures_unread: i64,
+    /// Disclosures marked failed, which are not read again.
+    pub disclosures_failed: i64,
+    pub attachments_pending: i64,
+    pub attachments_stored: i64,
+    pub attachments_failed: i64,
+}
+
 /// What a failed attempt was for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureStage {
@@ -215,6 +234,8 @@ pub struct StoredFile {
 
 pub struct Store {
     pool: SqlitePool,
+    /// The `seq` of the newest committed event.
+    latest_seq: watch::Sender<i64>,
 }
 
 impl Store {
@@ -256,7 +277,30 @@ impl Store {
 
     async fn migrated(pool: SqlitePool) -> Result<Self, StoreError> {
         sqlx::migrate!().run(&pool).await?;
-        Ok(Self { pool })
+        let seq = select_latest_seq(&pool).await?;
+        Ok(Self {
+            pool,
+            latest_seq: watch::Sender::new(seq),
+        })
+    }
+
+    /// A receiver of the `seq` of the newest event. It changes after each
+    /// transaction that wrote an event commits, never before.
+    pub fn watch_latest_seq(&self) -> watch::Receiver<i64> {
+        self.latest_seq.subscribe()
+    }
+
+    /// Announces the newest event a committed transaction wrote, if any.
+    fn announce(&self, written: Option<i64>) {
+        if let Some(seq) = written {
+            self.latest_seq.send_if_modified(|latest| {
+                let newer = seq > *latest;
+                if newer {
+                    *latest = seq;
+                }
+                newer
+            });
+        }
     }
 
     /// Stores a row of the exchange's list. For a disclosure already stored,
@@ -270,8 +314,10 @@ impl Store {
     pub async fn store_list_entry(&self, entry: &Fetched, now_ns: i64) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await?;
         let inserted = insert_disclosure(&mut tx, entry, false, now_ns).await?;
+        let mut written = None;
         if inserted {
-            write_corrected_event_for_original(&mut tx, &entry.disclosure, now_ns).await?;
+            written =
+                write_corrected_event_for_original(&mut tx, &entry.disclosure, now_ns).await?;
         } else {
             let stored: StoredDocument = sqlx::query_as(
                 "SELECT read_in_full, document FROM disclosures WHERE message_id = ?",
@@ -291,6 +337,7 @@ impl Store {
             }
         }
         tx.commit().await?;
+        self.announce(written);
         Ok(inserted)
     }
 
@@ -326,24 +373,29 @@ impl Store {
         .execute(&mut *tx)
         .await?;
 
-        match change {
-            FullRead::Unchanged => {}
+        let written = match change {
+            FullRead::Unchanged => None,
             FullRead::Revised => {
                 insert_attachments(&mut tx, &message.disclosure).await?;
-                write_event(&mut tx, event::Kind::Revised, message_id, 0, now_ns).await?;
+                write_event(&mut tx, event::Kind::Revised, message_id, 0, now_ns).await?
             }
             FullRead::First => {
                 insert_attachments(&mut tx, &message.disclosure).await?;
-                write_event(&mut tx, event::Kind::Discovered, message_id, 0, now_ns).await?;
-                if is_new {
-                    write_corrected_event_for_original(&mut tx, &message.disclosure, now_ns)
-                        .await?;
-                }
-                write_corrected_event_if_corrected(&mut tx, message_id, now_ns).await?;
+                let discovered =
+                    write_event(&mut tx, event::Kind::Discovered, message_id, 0, now_ns).await?;
+                let original = if is_new {
+                    write_corrected_event_for_original(&mut tx, &message.disclosure, now_ns).await?
+                } else {
+                    None
+                };
+                let corrected =
+                    write_corrected_event_if_corrected(&mut tx, message_id, now_ns).await?;
+                discovered.max(original).max(corrected)
             }
-        }
+        };
 
         tx.commit().await?;
+        self.announce(written);
         Ok(())
     }
 
@@ -490,9 +542,11 @@ impl Store {
         .bind(attachment_id)
         .execute(&mut *tx)
         .await?;
-        if next.exhausted && !already_failed {
-            set_attachment_failed(&mut tx, message_id, attachment_id, now_ns).await?;
-        }
+        let written = if next.exhausted && !already_failed {
+            set_attachment_failed(&mut tx, message_id, attachment_id, now_ns).await?
+        } else {
+            None
+        };
         let entry = FailureEntry {
             stage: FailureStage::Attachment,
             permanent: failure.permanent,
@@ -503,26 +557,40 @@ impl Store {
         };
         insert_failure(&mut tx, &entry, now_ns).await?;
         tx.commit().await?;
+        self.announce(written);
         Ok(Retry::after(&next, already_failed))
     }
 
     /// The sizes of the queues of `reader` and `downloader`, and the counts
     /// of disclosures and attachments marked failed.
     pub async fn queue_sizes(&self) -> Result<QueueSizes, StoreError> {
-        // The first two conditions repeat the WHERE clauses of the indexes
-        // `disclosures_unread` and `attachments_pending`; 1 is PENDING and 3
-        // is FAILED.
-        let sizes = sqlx::query_as(
+        let counts = self.counts().await?;
+        Ok(QueueSizes {
+            unread_disclosures: counts.disclosures_unread,
+            pending_attachments: counts.attachments_pending,
+            failed_disclosures: counts.disclosures_failed,
+            failed_attachments: counts.attachments_failed,
+        })
+    }
+
+    /// How many disclosures and attachments the store holds, by state.
+    pub async fn counts(&self) -> Result<Counts, StoreError> {
+        // The unread and pending conditions repeat the WHERE clauses of the
+        // indexes `disclosures_unread` and `attachments_pending`; 1 is
+        // PENDING, 2 is STORED and 3 is FAILED.
+        let counts = sqlx::query_as(
             "SELECT
+               (SELECT count(*) FROM disclosures) AS disclosures,
                (SELECT count(*) FROM disclosures
-                 WHERE (read_in_full = 0 OR reread = 1) AND failed = 0) AS unread_disclosures,
-               (SELECT count(*) FROM attachments WHERE state = 1) AS pending_attachments,
-               (SELECT count(*) FROM disclosures WHERE failed = 1) AS failed_disclosures,
-               (SELECT count(*) FROM attachments WHERE state = 3) AS failed_attachments",
+                 WHERE (read_in_full = 0 OR reread = 1) AND failed = 0) AS disclosures_unread,
+               (SELECT count(*) FROM disclosures WHERE failed = 1) AS disclosures_failed,
+               (SELECT count(*) FROM attachments WHERE state = 1) AS attachments_pending,
+               (SELECT count(*) FROM attachments WHERE state = 2) AS attachments_stored,
+               (SELECT count(*) FROM attachments WHERE state = 3) AS attachments_failed",
         )
         .fetch_one(&self.pool)
         .await?;
-        Ok(sizes)
+        Ok(counts)
     }
 
     /// Logs a failure to list one Oslo calendar day.
@@ -546,10 +614,27 @@ impl Store {
 
     /// Up to `limit` rows of the failure log, newest first.
     pub async fn failures(&self, limit: u32) -> Result<Vec<FailureRecord>, StoreError> {
+        self.failures_after(None, None, limit).await
+    }
+
+    /// Up to `limit` rows of the failure log, newest first: with
+    /// `message_id`, only the failures of that disclosure and its
+    /// attachments; with `after_id`, only those older than that row, to
+    /// continue where the previous call ended.
+    pub async fn failures_after(
+        &self,
+        message_id: Option<i64>,
+        after_id: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<FailureRecord>, StoreError> {
         let rows: Vec<FailureRow> = sqlx::query_as(
             "SELECT id, at_ns, stage, permanent, message_id, attachment_id, day, detail
-               FROM failures ORDER BY id DESC LIMIT ?",
+               FROM failures
+              WHERE (?1 IS NULL OR message_id = ?1) AND id < ?2
+              ORDER BY id DESC LIMIT ?3",
         )
+        .bind(message_id)
+        .bind(after_id.unwrap_or(i64::MAX))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -617,8 +702,9 @@ impl Store {
             });
         }
         let kind = event::Kind::AttachmentStored;
-        write_event(&mut tx, kind, message_id, attachment_id, now_ns).await?;
+        let written = write_event(&mut tx, kind, message_id, attachment_id, now_ns).await?;
         tx.commit().await?;
+        self.announce(written);
         Ok(())
     }
 
@@ -631,8 +717,9 @@ impl Store {
         now_ns: i64,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
-        set_attachment_failed(&mut tx, message_id, attachment_id, now_ns).await?;
+        let written = set_attachment_failed(&mut tx, message_id, attachment_id, now_ns).await?;
         tx.commit().await?;
+        self.announce(written);
         Ok(())
     }
 
@@ -660,7 +747,7 @@ impl Store {
         });
         let mut connection = self.pool.acquire().await?;
         let rows: Vec<DisclosureRow> = sqlx::query_as(
-            "SELECT message_id, document, read_in_full, received_at_ns,
+            "SELECT message_id, document, read_in_full, received_at_ns, failed,
                     (SELECT max(c.message_id) FROM disclosures c
                       WHERE c.correction_for_message_id = d.message_id)
                         AS corrected_by_message_id
@@ -723,11 +810,15 @@ impl Store {
 
     /// The `seq` of the newest event; 0 when the log is empty.
     pub async fn latest_seq(&self) -> Result<i64, StoreError> {
-        let seq = sqlx::query_scalar("SELECT coalesce(max(seq), 0) FROM events")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(seq)
+        select_latest_seq(&self.pool).await
     }
+}
+
+async fn select_latest_seq(pool: &SqlitePool) -> Result<i64, StoreError> {
+    let seq = sqlx::query_scalar("SELECT coalesce(max(seq), 0) FROM events")
+        .fetch_one(pool)
+        .await?;
+    Ok(seq)
 }
 
 /// What storing a disclosure read in full changes.
@@ -937,6 +1028,8 @@ struct DisclosureRow {
     document: String,
     read_in_full: bool,
     received_at_ns: i64,
+    /// The full read failed permanently and is not tried again.
+    failed: bool,
     /// The newest stored disclosure that corrects this one.
     corrected_by_message_id: Option<i64>,
 }
@@ -1036,12 +1129,13 @@ async fn replace_list_row(
 }
 
 /// Sets an attachment's state to FAILED and writes `ATTACHMENT_FAILED`.
+/// Returns the event's `seq`.
 async fn set_attachment_failed(
     connection: &mut SqliteConnection,
     message_id: i64,
     attachment_id: i64,
     now_ns: i64,
-) -> Result<(), StoreError> {
+) -> Result<Option<i64>, StoreError> {
     let updated =
         sqlx::query("UPDATE attachments SET state = ? WHERE message_id = ? AND attachment_id = ?")
             .bind(attachment::State::Failed as i32)
@@ -1107,18 +1201,19 @@ async fn insert_attachments(
     Ok(())
 }
 
-/// Writes an event that carries the disclosure as it now stands.
+/// Writes an event that carries the disclosure as it now stands. Returns the
+/// event's `seq`; `None` when no disclosure has the id and nothing is written.
 async fn write_event(
     connection: &mut SqliteConnection,
     kind: event::Kind,
     message_id: i64,
     attachment_id: i64,
     now_ns: i64,
-) -> Result<(), StoreError> {
+) -> Result<Option<i64>, StoreError> {
     let Some(disclosure) = load_disclosure(connection, message_id).await? else {
-        return Ok(());
+        return Ok(None);
     };
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO events (kind, at_ns, message_id, attachment_id, disclosure)
          VALUES (?, ?, ?, ?, ?)",
     )
@@ -1129,21 +1224,22 @@ async fn write_event(
     .bind(disclosure.encode_to_vec())
     .execute(connection)
     .await?;
-    Ok(())
+    Ok(Some(inserted.last_insert_rowid()))
 }
 
 /// A correction was stored for the first time: writes `CORRECTED` for the
 /// disclosure it corrects, when that one has been read in full. When it has
 /// not, `write_corrected_event_if_corrected` writes the event at its full
 /// read, so each pair gets one event whichever of the two arrives first.
+/// Returns the event's `seq`, when one is written.
 async fn write_corrected_event_for_original(
     connection: &mut SqliteConnection,
     correction: &Disclosure,
     now_ns: i64,
-) -> Result<(), StoreError> {
+) -> Result<Option<i64>, StoreError> {
     let original = correction.correction_for_message_id;
     if original == 0 {
-        return Ok(());
+        return Ok(None);
     }
     let read_in_full: Option<bool> =
         sqlx::query_scalar("SELECT read_in_full FROM disclosures WHERE message_id = ?")
@@ -1151,18 +1247,19 @@ async fn write_corrected_event_for_original(
             .fetch_optional(&mut *connection)
             .await?;
     if read_in_full == Some(true) {
-        write_event(connection, event::Kind::Corrected, original, 0, now_ns).await?;
+        return write_event(connection, event::Kind::Corrected, original, 0, now_ns).await;
     }
-    Ok(())
+    Ok(None)
 }
 
 /// A disclosure was read in full for the first time: writes `CORRECTED` for
-/// it when a stored disclosure corrects it.
+/// it when a stored disclosure corrects it. Returns the event's `seq`, when
+/// one is written.
 async fn write_corrected_event_if_corrected(
     connection: &mut SqliteConnection,
     message_id: i64,
     now_ns: i64,
-) -> Result<(), StoreError> {
+) -> Result<Option<i64>, StoreError> {
     let corrected: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM disclosures WHERE correction_for_message_id = ?)",
     )
@@ -1170,9 +1267,9 @@ async fn write_corrected_event_if_corrected(
     .fetch_one(&mut *connection)
     .await?;
     if corrected {
-        write_event(connection, event::Kind::Corrected, message_id, 0, now_ns).await?;
+        return write_event(connection, event::Kind::Corrected, message_id, 0, now_ns).await;
     }
-    Ok(())
+    Ok(None)
 }
 
 async fn load_disclosure(
@@ -1180,7 +1277,7 @@ async fn load_disclosure(
     message_id: i64,
 ) -> Result<Option<Disclosure>, StoreError> {
     let row: Option<DisclosureRow> = sqlx::query_as(
-        "SELECT message_id, document, read_in_full, received_at_ns,
+        "SELECT message_id, document, read_in_full, received_at_ns, failed,
                 (SELECT max(c.message_id) FROM disclosures c
                   WHERE c.correction_for_message_id = d.message_id)
                     AS corrected_by_message_id
@@ -1239,6 +1336,7 @@ fn decode_row(
         })?;
     disclosure.received_at_ns = row.received_at_ns;
     disclosure.corrected_by_message_id = row.corrected_by_message_id.unwrap_or_default();
+    disclosure.read_failed = row.failed;
     for attachment in &mut disclosure.attachments {
         if let Some(stored) = stored_attachments.remove(&attachment.id) {
             *attachment = Attachment {
@@ -1269,6 +1367,7 @@ mod tests {
             document: document.to_owned(),
             read_in_full: true,
             received_at_ns: RECEIVED_AT_NS,
+            failed: false,
             corrected_by_message_id,
         }
     }

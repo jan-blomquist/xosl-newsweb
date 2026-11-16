@@ -17,7 +17,7 @@ pub mod raw {
 
 #[cfg(test)]
 mod tests {
-    use super::{Attachment, Disclosure, Issuer, attachment};
+    use super::{Attachment, Category, Disclosure, Issuer, attachment};
     use prost::Message;
 
     #[test]
@@ -34,7 +34,11 @@ mod tests {
             markets: vec!["XOSL".into()],
             published_at_ns: 1_762_000_000_000_000_000,
             title: "Q3 2025".into(),
-            category_ids: vec![1002, 9999],
+            categories: vec![Category {
+                id: 1002,
+                name_en: "HALF YEAR FINANCIAL REPORT".into(),
+                ..Default::default()
+            }],
             attachments: vec![Attachment {
                 id: 7,
                 name: "report.pdf".into(),

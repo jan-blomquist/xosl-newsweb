@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use xosl_newsweb::exchange::{self, Fetched};
 use xosl_newsweb::pb::{DisclosureFilter, attachment, event};
 use xosl_newsweb::store::{
-    AttachmentRef, Failure, FailureRecord, FailureStage, ListedDay, Position, QueueSizes, Retry,
-    Store, StoredFile,
+    AttachmentRef, Counts, Failure, FailureRecord, FailureStage, ListedDay, Position, QueueSizes,
+    Retry, Store, StoredFile,
 };
 
 const NOON_NS: i64 = 1_790_078_400_000_000_000;
@@ -934,6 +934,20 @@ async fn record_read_failure__third_permanent_failure__removes_it_from_the_queue
 }
 
 #[tokio::test]
+async fn disclosure__read_failed_for_good__carries_read_failed() {
+    let store = store().await;
+    store
+        .store_list_entry(&listed(&message(1)), NOW_NS)
+        .await
+        .unwrap();
+    record_read_failures(&store, 1, &permanent(), 3).await;
+
+    let disclosure = store.disclosure(1).await.unwrap().unwrap();
+
+    assert!(disclosure.read_failed);
+}
+
+#[tokio::test]
 async fn record_read_failure__permanent_failure__retries_after_the_first_delay() {
     let store = store().await;
     store
@@ -1272,6 +1286,154 @@ async fn open__existing_file__reads_what_an_earlier_store_wrote() {
     let store = Store::open(&path).await.unwrap();
 
     assert!(store.disclosure(1).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn watch_latest_seq__existing_file__starts_at_its_latest_seq() {
+    let folder = tempfile::tempdir().unwrap();
+    let path = folder.path().join("mirror.sqlite");
+    let earlier = Store::open(&path).await.unwrap();
+    for message_id in [1, 2] {
+        earlier
+            .store_message(&full(&message(message_id)), NOW_NS)
+            .await
+            .unwrap();
+    }
+    drop(earlier);
+
+    let store = Store::open(&path).await.unwrap();
+
+    assert_eq!(*store.watch_latest_seq().borrow(), 2);
+}
+
+// The channel of the newest event's seq.
+
+#[tokio::test]
+async fn watch_latest_seq__first_full_read__holds_the_seq_of_its_event() {
+    let store = store().await;
+    let latest = store.watch_latest_seq();
+
+    store
+        .store_message(&full(&message(1)), NOW_NS)
+        .await
+        .unwrap();
+
+    assert_eq!(*latest.borrow(), 1);
+}
+
+#[tokio::test]
+async fn watch_latest_seq__write_without_an_event__is_not_changed() {
+    let store = store().await;
+    let latest = store.watch_latest_seq();
+
+    store
+        .store_list_entry(&listed(&message(1)), NOW_NS)
+        .await
+        .unwrap();
+
+    assert!(!latest.has_changed().unwrap());
+}
+
+#[tokio::test]
+async fn watch_latest_seq__events_of_each_kind__holds_the_newest_seq() {
+    let store = store().await;
+    let latest = store.watch_latest_seq();
+    let attached = with_attachments(message(1), &[9, 10, 11]);
+    store.store_message(&full(&attached), NOW_NS).await.unwrap();
+    let file = StoredFile {
+        content_type: "application/pdf".into(),
+        size_bytes: 4,
+        sha256: "00".into(),
+    };
+    store
+        .mark_attachment_stored(1, 9, &file, NOW_NS)
+        .await
+        .unwrap();
+    store.mark_attachment_failed(1, 10, NOW_NS).await.unwrap();
+
+    record_attachment_failures(&store, 1, 11, &permanent(), 3).await;
+
+    assert_eq!(*latest.borrow(), 4);
+}
+
+// The counts of what the store holds.
+
+#[tokio::test]
+async fn counts__disclosures_and_attachments_in_each_state__counts_each() {
+    let store = store_with_attachment().await;
+    let attached = with_attachments(message(2), &[5, 6]);
+    store.store_message(&full(&attached), NOW_NS).await.unwrap();
+    let file = StoredFile {
+        content_type: "application/pdf".into(),
+        size_bytes: 4,
+        sha256: "00".into(),
+    };
+    store
+        .mark_attachment_stored(2, 5, &file, NOW_NS)
+        .await
+        .unwrap();
+    store.mark_attachment_failed(2, 6, NOW_NS).await.unwrap();
+    for message_id in [3, 4] {
+        store
+            .store_list_entry(&listed(&message(message_id)), NOW_NS)
+            .await
+            .unwrap();
+    }
+    record_read_failures(&store, 4, &permanent(), 3).await;
+
+    let counts = store.counts().await.unwrap();
+
+    let expected = Counts {
+        disclosures: 4,
+        disclosures_unread: 1,
+        disclosures_failed: 1,
+        attachments_pending: 1,
+        attachments_stored: 1,
+        attachments_failed: 1,
+    };
+    assert_eq!(counts, expected);
+}
+
+// Pages of the failure log.
+
+/// A store whose failure log holds, in order: a read failure of 1, one of 2,
+/// a download failure of attachment 9 of 1, and a failure to list a day.
+async fn store_with_failures() -> Store {
+    let store = store_with_attachment().await;
+    store
+        .store_list_entry(&listed(&message(2)), NOW_NS)
+        .await
+        .unwrap();
+    record_read_failures(&store, 1, &transient(), 1).await;
+    record_read_failures(&store, 2, &transient(), 1).await;
+    record_attachment_failures(&store, 1, 9, &transient(), 1).await;
+    store
+        .record_list_failure(Date::constant(2026, 9, 22), "HTTP 503", NOW_NS)
+        .await
+        .unwrap();
+    store
+}
+
+fn ids(failures: &[FailureRecord]) -> Vec<i64> {
+    failures.iter().map(|failure| failure.id).collect()
+}
+
+#[tokio::test]
+async fn failures_after__message_id__returns_only_the_failures_of_that_disclosure() {
+    let store = store_with_failures().await;
+
+    let failures = store.failures_after(Some(1), None, 10).await.unwrap();
+
+    assert_eq!(ids(&failures), [3, 1]);
+}
+
+#[tokio::test]
+async fn failures_after__after_id__continues_with_older_rows() {
+    let store = store_with_failures().await;
+
+    let failures = store.failures_after(None, Some(3), 10).await.unwrap();
+
+    assert_eq!(ids(&failures), [2, 1]);
 }
 
 #[tokio::test]
