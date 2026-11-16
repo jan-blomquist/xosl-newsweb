@@ -37,7 +37,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       # just lands in ~/.local/bin, no sudo. Same artefact and sha256 as the
-      # Dockerfile's.
+      # dev.Dockerfile's.
       - name: Install just
         run: |
           set -euo pipefail
@@ -49,7 +49,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # buf and the plugins that write the Rust code of the contract. Same
-      # artefacts and sha256 as the Dockerfile's.
+      # artefacts and sha256 as the dev.Dockerfile's.
       - name: Install buf and its plugins
         run: |
           set -euo pipefail

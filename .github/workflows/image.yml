@@ -1,0 +1,115 @@
+# The release image (Dockerfile). A pull request that changes what the image
+# is built from builds it and starts it once; a version tag publishes it to
+# ghcr.io with a signed record of where and from which commit it was built.
+name: image
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - .cargo/**
+      - Cargo.toml
+      - Cargo.lock
+      - migrations/**
+      - .github/workflows/image.yml
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Builds the image and checks the three things only a container shows: the
+  # service starts as its unprivileged user on a read-only file system, the
+  # image's health check passes, and SIGTERM stops it cleanly.
+  build:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          load: true
+          tags: xosl-newsweb:pull-request
+
+      # Ingest stays off: the run sends the exchange no request.
+      - name: Start, become healthy, stop
+        run: |
+          set -euo pipefail
+          docker run --detach --name mirror --read-only --tmpfs /tmp --cap-drop ALL \
+            --health-interval 2s xosl-newsweb:pull-request
+          for _ in $(seq 30); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' mirror)
+            [ "$status" = healthy ] && break
+            sleep 2
+          done
+          docker logs mirror
+          [ "$status" = healthy ]
+          docker exec mirror /xosl-newsweb status
+          docker stop --time 30 mirror
+          [ "$(docker inspect --format '{{.State.ExitCode}}' mirror)" = 0 ]
+
+  publish:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      # The signed build record: issued to this workflow run, stored with the
+      # repository and beside the image.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: The tag is the version in Cargo.toml
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          [ "$GITHUB_REF_NAME" = "v$version" ] || {
+            echo "::error::tag $GITHUB_REF_NAME, but Cargo.toml has version $version"
+            exit 1
+          }
+
+      - uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # v0.1.0 becomes the tags 0.1.0, 0.1 and latest, with the standard
+      # labels (source, revision, version, licence).
+      - id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - id: push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

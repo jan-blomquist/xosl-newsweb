@@ -4,7 +4,7 @@
 # network, no agent. Optional: `cargo` on the host works as well (README).
 name: default
 extends: vz-debian-trixie
-image: { dockerfile: Dockerfile }
+image: { dockerfile: dev.Dockerfile }
 shell: fish
 
 banner: |2

@@ -1,2 +1,8 @@
-# The dev image copies nothing from the repository; keep the build context empty.
+# The build context is what the release image compiles, and nothing else. The
+# dev image (dev.Dockerfile) copies nothing from it.
 *
+!.cargo
+!Cargo.lock
+!Cargo.toml
+!migrations
+!src

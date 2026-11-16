@@ -1,0 +1,32 @@
+# A sample: the mirror with ingest on, its data in ./data beside this file.
+#
+#   mkdir data && docker compose up -d
+#
+# The image's own health check runs `xosl-newsweb health` every 30 seconds;
+# `docker compose ps` shows the result.
+services:
+  xosl-newsweb:
+    image: ghcr.io/jan-blomquist/xosl-newsweb:0.1.0
+    restart: unless-stopped
+    # The owner of ./data on the host. Without this line the service runs as
+    # user 65532, and ./data has to belong to that user.
+    user: "1000:1000"
+    environment:
+      XOSL_NEWSWEB_INGEST: "true"
+      XOSL_NEWSWEB_LOG_FORMAT: json
+      # XOSL_NEWSWEB_WEBHOOK_URL: http://consumer:8080/newsweb
+      # XOSL_NEWSWEB_WEBHOOK_SECRET: change-me
+    volumes:
+      - ./data:/data
+    # Reachable from this host only. The API has no authentication: publish it
+    # wider only on a network you trust.
+    ports:
+      - "127.0.0.1:50051:50051"
+    # The service writes to /data, and SQLite to /tmp for a large sort.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
