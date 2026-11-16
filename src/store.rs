@@ -812,6 +812,27 @@ impl Store {
     pub async fn latest_seq(&self) -> Result<i64, StoreError> {
         select_latest_seq(&self.pool).await
     }
+
+    /// The `seq` of the last event delivered to the consumer `name`; `None`
+    /// when no position is stored for it.
+    pub async fn delivery_position(&self, name: &str) -> Result<Option<i64>, StoreError> {
+        let seq = sqlx::query_scalar("SELECT seq FROM delivery_positions WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(seq)
+    }
+
+    /// Stores `seq` as the last event delivered to the consumer `name`,
+    /// replacing its earlier position.
+    pub async fn set_delivery_position(&self, name: &str, seq: i64) -> Result<(), StoreError> {
+        sqlx::query("INSERT OR REPLACE INTO delivery_positions (name, seq) VALUES (?, ?)")
+            .bind(name)
+            .bind(seq)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 async fn select_latest_seq(pool: &SqlitePool) -> Result<i64, StoreError> {
