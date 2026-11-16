@@ -1,61 +1,40 @@
 # syntax=docker/dockerfile:1
-# check=skip=InvalidDefaultArgInFrom
-# The dev image: the toolchain, on the image vz passes as BASE (vz.yml). It is
-# not the image the service ships in. Tools live under /usr/local, never in a
-# home.
-ARG BASE
+# The release image: the binary and nothing else, on a base without a shell or
+# a package manager. The dev image is dev.Dockerfile.
 
-# Vendor releases, each pinned by sha256; bind-mounted below, so no layer keeps them.
-FROM scratch AS bins
-ADD --checksum=sha256:409044617b6f06517c1035e55ca38c8c856ff8b650e41bc2aa1ef82d5903a23e \
-    https://github.com/casey/just/releases/download/1.59.0/just-1.59.0-x86_64-unknown-linux-musl.tar.gz /just.tgz
-# buf and its three plugins generate the Rust code of the gRPC contract.
-ADD --checksum=sha256:7168a06e29bd5eb8d1530848f242264f7a86b9b8af3b2e811570fbea0c929a30 \
-    https://github.com/bufbuild/buf/releases/download/v1.75.0/buf-Linux-x86_64.tar.gz /buf.tgz
-ADD --checksum=sha256:038a43ee2df38504bc28b9adc078733622be367af9f58dd874c7e4e02b2b8756 \
-    https://github.com/cargo-bins/cargo-quickinstall/releases/download/protoc-gen-prost-0.5.0/protoc-gen-prost-0.5.0-x86_64-unknown-linux-musl.tar.gz /protoc-gen-prost.tgz
-ADD --checksum=sha256:0eb4ce2f823371abfc82631b7e11ff8c93ca196453b9ec55256b51d2826decae \
-    https://github.com/cargo-bins/cargo-quickinstall/releases/download/protoc-gen-prost-serde-0.4.0/protoc-gen-prost-serde-0.4.0-x86_64-unknown-linux-musl.tar.gz /protoc-gen-prost-serde.tgz
-ADD --checksum=sha256:44dbd20acdb50454380918ab6de336dd1fc55e4f5e6788b8a886e598811fba4d \
-    https://github.com/cargo-bins/cargo-quickinstall/releases/download/protoc-gen-tonic-0.5.0/protoc-gen-tonic-0.5.0-x86_64-unknown-linux-musl.tar.gz /protoc-gen-tonic.tgz
-ADD --chmod=755 --checksum=sha256:b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55 \
-    https://static.rust-lang.org/rustup/archive/1.29.3/x86_64-unknown-linux-gnu/rustup-init /rustup-init
-
-FROM ${BASE}
-ARG DEBIAN_FRONTEND=noninteractive
-# The C toolchain with cmake (SQLite and the TLS library are compiled into the
-# binary) and mold for linking, the sqlite3 shell for looking into the
-# database, the shell tools.
+# The Rust version is the one in rust-toolchain.toml: bump the two together.
+# rust-toolchain.toml itself stays out of the build context, so rustup
+# downloads no component the build does not use.
+FROM rust:1.100.0-slim-trixie@sha256:e9d95b74296f7126a83ae3d041aeaba1ff4c478f13abc5cc034fcf7c131c3d4a AS build
+# The C toolchain with cmake: SQLite and the TLS library are compiled into the
+# binary.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-      build-essential cmake curl fish git jq less mold nano pkg-config procps \
-      ripgrep sqlite3 tmux tree \
+ && apt-get install -y --no-install-recommends build-essential cmake pkg-config \
  && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+# --locked: the build fails when Cargo.lock does not match Cargo.toml. The
+# empty /data is copied below, so that the data folder belongs to the user the
+# service runs as.
+RUN cargo build --release --locked \
+ && cp target/release/xosl-newsweb /xosl-newsweb \
+ && mkdir /data
 
-RUN --mount=type=bind,from=bins,target=/tmp/bins \
-    set -e; cd /tmp/bins; bin=/usr/local/bin; \
-    tar -xzf just.tgz -C $bin --no-same-owner just; \
-    tar -xzf buf.tgz -C /usr/local --strip-components=1 --no-same-owner buf/bin buf/share; \
-    for p in protoc-gen-prost protoc-gen-prost-serde protoc-gen-tonic; do \
-      tar -xzf $p.tgz -C $bin --no-same-owner $p; \
-    done
+# glibc, libgcc and the CA certificates; runs as user 65532, not root.
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2
+COPY --from=build /xosl-newsweb /xosl-newsweb
+COPY --from=build --chown=65532:65532 /data /data
 
-# Rust where the official image keeps it, writable by every user. The version
-# is the one in rust-toolchain.toml: bump the two together. Crate downloads are
-# state in vz.yml.
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH
-RUN --mount=type=bind,from=bins,source=/rustup-init,target=/tmp/rustup-init \
-    /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain 1.100.0 \
-      -c rustfmt -c clippy -c rust-src -c rust-analyzer \
- && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
+# Inside a container the server listens on every interface; which host
+# address reaches it is decided where the port is published.
+ENV XOSL_NEWSWEB_DATA_DIR=/data \
+    XOSL_NEWSWEB_LISTEN=0.0.0.0:50051
+VOLUME /data
+EXPOSE 50051
 
-# Dev-profile debuginfo trimmed to line tables; mold links.
-ENV CARGO_PROFILE_DEV_DEBUG=line-tables-only \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold" \
-    EDITOR=nano
+# The binary asks its own server; the image has no shell and no curl.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD ["/xosl-newsweb", "health"]
 
-# No greeting; completions for `just` in every user's fish.
-RUN printf 'set -g fish_greeting\n' > /etc/fish/conf.d/vz.fish \
- && just --completions fish > /usr/share/fish/vendor_completions.d/just.fish
+ENTRYPOINT ["/xosl-newsweb"]
+CMD ["run"]

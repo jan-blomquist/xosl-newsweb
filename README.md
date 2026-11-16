@@ -58,7 +58,7 @@ lists them.
 | `--request-interval-ms <N>` | `XOSL_NEWSWEB_REQUEST_INTERVAL_MS` | `1000` | The shortest time between two requests to the exchange; at least 1000. |
 | `--poll-interval-secs <N>` | `XOSL_NEWSWEB_POLL_INTERVAL_SECS` | `60` | How often today is listed; at least 1. |
 | `--lookback-days <N>` | `XOSL_NEWSWEB_LOOKBACK_DAYS` | `7` | How many past days are kept complete; at least 1. |
-| `--listen <ADDRESS>` | `XOSL_NEWSWEB_LISTEN` | `127.0.0.1:50051` | The address of the gRPC server. In a container, listen on `0.0.0.0:50051`. |
+| `--listen <ADDRESS>` | `XOSL_NEWSWEB_LISTEN` | `127.0.0.1:50051` | The address of the gRPC server. The container image sets `0.0.0.0:50051`. |
 | `--log-format <FORMAT>` | `XOSL_NEWSWEB_LOG_FORMAT` | `text` | How log lines are written: `text` or `json`. |
 | `--webhook-url <URL>` | `XOSL_NEWSWEB_WEBHOOK_URL` | none | Sends each event to this URL. See "Webhook". |
 | `--webhook-secret <SECRET>` | `XOSL_NEWSWEB_WEBHOOK_SECRET` | none | Signs each webhook request. |
@@ -76,6 +76,40 @@ The data folder holds:
 Out of scope: search, text extraction, classification and anything else
 derived from the disclosures. Those belong in the programs that consume the
 mirror.
+
+### In a container
+
+Each version is published as `ghcr.io/jan-blomquist/xosl-newsweb:<version>`,
+for `linux/amd64`. The image holds the binary on a base without a shell or a
+package manager, and runs it as user 65532. In the image the data folder is
+`/data` and the server listens on `0.0.0.0:50051`.
+
+[`compose.yaml`](compose.yaml) is a sample: ingest on, the data in `./data`,
+the API published to the host only, a read-only file system and no
+capabilities.
+
+```
+mkdir data
+docker compose up -d
+docker compose ps                                   # shows the health
+docker compose exec xosl-newsweb /xosl-newsweb status
+```
+
+`./data` must belong to the user the service runs as: the sample sets
+`user: "1000:1000"`.
+
+Each image carries a signed record of the workflow run and the commit it was
+built from. To verify it with the [GitHub CLI](https://cli.github.com):
+
+```
+gh attestation verify oci://ghcr.io/jan-blomquist/xosl-newsweb:<version> \
+  --repo jan-blomquist/xosl-newsweb
+```
+
+To back the mirror up, copy the data folder while the service is stopped. A
+copy taken while it runs must include `mirror.sqlite-wal` and can still be
+inconsistent; `sqlite3 mirror.sqlite ".backup <file>"` takes a consistent copy
+of the database from a running mirror.
 
 ### Health
 
@@ -95,15 +129,18 @@ becomes unhealthy.
 `xosl-newsweb health` asks the server for its status and prints one line:
 `healthy` (exit code 0), `unhealthy` (exit code 1), or `unreachable: <cause>`
 (exit code 1) when the call fails within 5 seconds. `--address <URL>`
-(`XOSL_NEWSWEB_ADDRESS`, default `http://127.0.0.1:50051`) names the server. The release image has no shell and no curl, so Docker Compose runs
-the binary itself:
+(`XOSL_NEWSWEB_ADDRESS`, default `http://127.0.0.1:50051`) names the server.
 
-```yaml
-healthcheck:
-  test: ["CMD", "/xosl-newsweb", "health"]
-  interval: 30s
-  start_period: 60s
+The container image has no shell and no curl, so its health check runs the
+binary itself, every 30 seconds:
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD ["/xosl-newsweb", "health"]
 ```
+
+Docker and Docker Compose show the result as the container's health, with no
+setting of their own.
 
 ### Webhook
 
@@ -225,7 +262,7 @@ defaults keep the load low:
 
 1. Open the dev shell with
    [viz-shell](https://github.com/jan-blomquist/viz-shell). It is a container
-   with every tool at a pinned version, described by `vz.yml` and `Dockerfile`:
+   with every tool at a pinned version, described by `vz.yml` and `dev.Dockerfile`:
 
    ```
    vz new
@@ -265,6 +302,11 @@ per second. It is for manual use, and the gate never runs it.
 Changes arrive as pull requests, squash-merged once the `gate` workflow is
 green. The gate runs `just check`: format, clippy, buf lint, the unit tests
 and the integration tests.
+
+A release is a tag: `v<version>`, with the version in `Cargo.toml`, on a
+commit of `master`. The `image` workflow builds the image from `Dockerfile`
+and publishes it. A pull request that changes what the image is built from
+builds it too, starts it and waits for its health check to pass.
 
 ## License
 
