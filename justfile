@@ -7,7 +7,7 @@ default:
     @just --list
 
 # Every check, in order; the first failure stops the run.
-check: fmt-check lint buf-lint test
+check: fmt-check lint buf-lint test test-integration
 
 # rustfmt over the crate.
 fmt-check:
@@ -25,13 +25,17 @@ buf-lint:
 gen:
     cd contracts && buf generate --template newsweb/buf.gen.yaml
 
-# Unit and integration tests.
+# The unit tests, inline in src/: in memory, no file, database or network.
 test:
-    cargo test
+    cargo test --lib --bins
+
+# The integration tests under tests/, except the live ones: they run SQLite.
+test-integration:
+    cargo test --test '*'
 
 # The tests that call the real exchange: a few requests, one per second.
 test-live:
-    cargo test -- --ignored --nocapture live
+    cargo test --test live -- --ignored --nocapture
 
 # The release binary, in target/release/.
 build:

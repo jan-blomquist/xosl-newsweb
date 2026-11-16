@@ -91,10 +91,12 @@ defaults keep the load low:
 2. Inside it, run the checks or build the binary:
 
    ```
-   just check     # format, clippy, buf lint, tests: what every pull request must pass
-   just gen       # regenerate the Rust code after changing a .proto file
-   just test-live # the tests that call the real exchange; never run by the gate
-   just build     # the release binary, in target/release/
+   just check              # everything a pull request must pass
+   just test               # the unit tests only
+   just test-integration   # the integration tests only
+   just test-live          # the tests that call the real exchange
+   just gen                # regenerate the Rust code after changing a .proto file
+   just build              # the release binary, in target/release/
    ```
 
    From the host, `vz -- just check` runs one command in the shell.
@@ -102,8 +104,17 @@ defaults keep the load low:
 Without viz-shell, the same recipes work with Rust at the version in
 `rust-toolchain.toml` and [just](https://github.com/casey/just) installed.
 
+The tests are in two places, by what they touch:
+
+- **Unit tests** are inline in `src/`, beside the code. They run in memory:
+  no file, no database, no network, no real clock.
+- **Integration tests** are under `tests/`. `tests/store.rs` runs the schema
+  and the queries against SQLite. `tests/live.rs` calls the real exchange and
+  is ignored unless run with `just test-live`; the gate never runs it.
+
 Changes arrive as pull requests, squash-merged once the `gate` workflow is
-green. The gate runs `just check`.
+green. The gate runs `just check`: format, clippy, buf lint, the unit tests
+and the integration tests.
 
 ## License
 

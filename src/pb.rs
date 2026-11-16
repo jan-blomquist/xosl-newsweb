@@ -5,8 +5,8 @@
 //! `contracts/` and committed. Never edit it: change the `.proto`, then
 //! regenerate.
 
-// Generated code: not every message and stub is used, and none of it is linted.
-#![allow(dead_code, clippy::all)]
+// Generated code is not linted.
+#![allow(clippy::all)]
 
 include!("gen/com/vizroy/xosl/newsweb/v1/com.vizroy.xosl.newsweb.v1.rs");
 
