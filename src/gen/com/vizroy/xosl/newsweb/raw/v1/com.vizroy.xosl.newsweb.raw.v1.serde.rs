@@ -1275,3 +1275,152 @@ impl<'de> serde::Deserialize<'de> for MessageResponse {
         deserializer.deserialize_struct("com.vizroy.xosl.newsweb.raw.v1.MessageResponse", FIELDS, GeneratedVisitor)
     }
 }
+impl serde::Serialize for Urls {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.version.is_empty() {
+            len += 1;
+        }
+        if !self.build_time.is_empty() {
+            len += 1;
+        }
+        if !self.api_large.is_empty() {
+            len += 1;
+        }
+        if !self.public_url.is_empty() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("com.vizroy.xosl.newsweb.raw.v1.Urls", len)?;
+        if !self.version.is_empty() {
+            struct_ser.serialize_field("version", &self.version)?;
+        }
+        if !self.build_time.is_empty() {
+            struct_ser.serialize_field("buildTime", &self.build_time)?;
+        }
+        if !self.api_large.is_empty() {
+            struct_ser.serialize_field("apiLarge", &self.api_large)?;
+        }
+        if !self.public_url.is_empty() {
+            struct_ser.serialize_field("publicUrl", &self.public_url)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for Urls {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "version",
+            "build_time",
+            "buildTime",
+            "api_large",
+            "apiLarge",
+            "public_url",
+            "publicUrl",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Version,
+            BuildTime,
+            ApiLarge,
+            PublicUrl,
+            __SkipField__,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "version" => Ok(GeneratedField::Version),
+                            "buildTime" | "build_time" => Ok(GeneratedField::BuildTime),
+                            "apiLarge" | "api_large" => Ok(GeneratedField::ApiLarge),
+                            "publicUrl" | "public_url" => Ok(GeneratedField::PublicUrl),
+                            _ => Ok(GeneratedField::__SkipField__),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = Urls;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct com.vizroy.xosl.newsweb.raw.v1.Urls")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<Urls, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut version__ = None;
+                let mut build_time__ = None;
+                let mut api_large__ = None;
+                let mut public_url__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Version => {
+                            if version__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("version"));
+                            }
+                            version__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::BuildTime => {
+                            if build_time__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("buildTime"));
+                            }
+                            build_time__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::ApiLarge => {
+                            if api_large__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("apiLarge"));
+                            }
+                            api_large__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::PublicUrl => {
+                            if public_url__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("publicUrl"));
+                            }
+                            public_url__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::__SkipField__ => {
+                            let _ = map_.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(Urls {
+                    version: version__.unwrap_or_default(),
+                    build_time: build_time__.unwrap_or_default(),
+                    api_large: api_large__.unwrap_or_default(),
+                    public_url: public_url__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("com.vizroy.xosl.newsweb.raw.v1.Urls", FIELDS, GeneratedVisitor)
+    }
+}

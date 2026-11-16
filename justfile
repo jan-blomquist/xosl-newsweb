@@ -29,6 +29,10 @@ gen:
 test:
     cargo test
 
+# The tests that call the real exchange: a few requests, one per second.
+test-live:
+    cargo test -- --ignored --nocapture live
+
 # The release binary, in target/release/.
 build:
     cargo build --release

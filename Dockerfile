@@ -23,11 +23,12 @@ ADD --chmod=755 --checksum=sha256:dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a
 
 FROM ${BASE}
 ARG DEBIAN_FRONTEND=noninteractive
-# The C toolchain (SQLite is compiled into the binary) and mold for linking,
-# the sqlite3 shell for looking into the database, the shell tools.
+# The C toolchain with cmake (SQLite and the TLS library are compiled into the
+# binary) and mold for linking, the sqlite3 shell for looking into the
+# database, the shell tools.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      build-essential curl fish git jq less mold nano pkg-config procps \
+      build-essential cmake curl fish git jq less mold nano pkg-config procps \
       ripgrep sqlite3 tmux tree \
  && rm -rf /var/lib/apt/lists/*
 
