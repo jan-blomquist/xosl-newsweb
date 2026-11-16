@@ -1,5 +1,8 @@
 /target/
 
+# The data folder of `just dev`.
+/data/
+
 # viz-shell's state: caches and shell history, per repository.
 /.vz_state/
 

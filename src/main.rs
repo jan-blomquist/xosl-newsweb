@@ -1,7 +1,9 @@
-//! The `xosl-newsweb` binary: the mirror and its command-line client.
-//!
-//! For now it prints its version.
+//! The `xosl-newsweb` binary. Everything it does is in the library, starting
+//! at `cli::main`.
 
-fn main() {
-    println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+use std::process::ExitCode;
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    xosl_newsweb::cli::main().await
 }

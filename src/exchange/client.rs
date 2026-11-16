@@ -153,10 +153,50 @@ struct ApiBase {
     resolved_at: Instant,
 }
 
+/// The calls of the NewsWeb API that ingest makes. The seam between the
+/// ingest jobs and the client; each method has the contract of the
+/// `Client` method of the same name.
+pub trait Exchange {
+    /// The disclosures of one Oslo calendar day, not read in full.
+    fn list(&self, day: Date) -> impl Future<Output = Result<Page, ClientError>> + Send;
+
+    /// One disclosure, read in full.
+    fn message(&self, message_id: i64)
+    -> impl Future<Output = Result<Fetched, ClientError>> + Send;
+
+    /// One attachment's bytes, unchanged.
+    fn attachment(
+        &self,
+        message_id: i64,
+        attachment_id: i64,
+    ) -> impl Future<Output = Result<Bytes, ClientError>> + Send;
+}
+
 pub struct Client<T = HttpTransport> {
     transport: T,
     limiter: RateLimiter,
     api_base: Mutex<Option<ApiBase>>,
+}
+
+impl<T: Transport + Sync> Exchange for Client<T> {
+    fn list(&self, day: Date) -> impl Future<Output = Result<Page, ClientError>> + Send {
+        Client::list(self, day)
+    }
+
+    fn message(
+        &self,
+        message_id: i64,
+    ) -> impl Future<Output = Result<Fetched, ClientError>> + Send {
+        Client::message(self, message_id)
+    }
+
+    fn attachment(
+        &self,
+        message_id: i64,
+        attachment_id: i64,
+    ) -> impl Future<Output = Result<Bytes, ClientError>> + Send {
+        Client::attachment(self, message_id, attachment_id)
+    }
 }
 
 impl<T: Transport> Client<T> {
