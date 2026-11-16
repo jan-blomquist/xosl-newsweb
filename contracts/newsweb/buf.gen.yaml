@@ -7,5 +7,11 @@ plugins:
     out: ../src/gen
     opt:
       - bytes=.
+  # serde impls that read and write proto-JSON. A key the messages do not
+  # name is skipped, since the exchange's JSON carries some.
+  - local: protoc-gen-prost-serde
+    out: ../src/gen
+    opt:
+      - ignore_unknown_fields=true
   - local: protoc-gen-tonic
     out: ../src/gen

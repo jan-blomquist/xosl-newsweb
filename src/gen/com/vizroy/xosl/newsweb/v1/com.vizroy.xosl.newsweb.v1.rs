@@ -270,5 +270,6 @@ pub struct WatchEventsResponse {
     #[prost(message, optional, tag="1")]
     pub event: ::core::option::Option<Event>,
 }
+include!("com.vizroy.xosl.newsweb.v1.serde.rs");
 include!("com.vizroy.xosl.newsweb.v1.tonic.rs");
 // @@protoc_insertion_point(module)

@@ -2,6 +2,7 @@
 //!
 //! For now it prints its version.
 
+mod exchange;
 mod pb;
 
 fn main() {
