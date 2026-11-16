@@ -123,3 +123,10 @@ CREATE TABLE listed_days (
     -- 1: the day is known to be complete.
     sealed       INTEGER NOT NULL
 ) STRICT, WITHOUT ROWID;
+
+-- One row per consumer of the event log that the mirror delivers to, such as
+-- the webhook: the `seq` of the last event delivered to it.
+CREATE TABLE delivery_positions (
+    name TEXT    PRIMARY KEY,
+    seq  INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;

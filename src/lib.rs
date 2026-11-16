@@ -5,6 +5,7 @@
 //! API.
 
 pub mod cli;
+pub mod client;
 pub mod clock;
 pub mod exchange;
 pub mod files;
@@ -14,3 +15,4 @@ pub mod logging;
 pub mod pb;
 pub mod server;
 pub mod store;
+pub mod webhook;

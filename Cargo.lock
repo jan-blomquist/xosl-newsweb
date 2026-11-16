@@ -3087,6 +3087,7 @@ dependencies = [
  "bytes",
  "clap",
  "hex",
+ "hmac",
  "infer",
  "jiff",
  "object_store",

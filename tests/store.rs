@@ -1636,3 +1636,43 @@ async fn queue_sizes__failed_disclosure_and_failed_attachment__counts_each_faile
         }
     );
 }
+
+// The delivery positions of the consumers of the event log.
+
+#[tokio::test]
+async fn delivery_position__nothing_stored__returns_none() {
+    let store = store().await;
+
+    let position = store.delivery_position("webhook").await.unwrap();
+
+    assert_eq!(position, None);
+}
+
+#[tokio::test]
+async fn set_delivery_position__new_name__is_returned_by_delivery_position() {
+    let store = store().await;
+
+    store.set_delivery_position("webhook", 7).await.unwrap();
+
+    assert_eq!(store.delivery_position("webhook").await.unwrap(), Some(7));
+}
+
+#[tokio::test]
+async fn set_delivery_position__name_already_stored__replaces_its_seq() {
+    let store = store().await;
+    store.set_delivery_position("webhook", 7).await.unwrap();
+
+    store.set_delivery_position("webhook", 9).await.unwrap();
+
+    assert_eq!(store.delivery_position("webhook").await.unwrap(), Some(9));
+}
+
+#[tokio::test]
+async fn set_delivery_position__other_name__leaves_the_first_unchanged() {
+    let store = store().await;
+    store.set_delivery_position("webhook", 7).await.unwrap();
+
+    store.set_delivery_position("archive", 3).await.unwrap();
+
+    assert_eq!(store.delivery_position("webhook").await.unwrap(), Some(7));
+}

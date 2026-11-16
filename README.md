@@ -36,9 +36,6 @@ gRPC is the only interface. The database schema and the file layout are
 internal and can change between versions, so no other program should read
 them directly.
 
-A command-line client for those calls, in the same binary, does not exist
-yet.
-
 ## Running
 
 ```
@@ -63,6 +60,8 @@ lists them.
 | `--lookback-days <N>` | `XOSL_NEWSWEB_LOOKBACK_DAYS` | `7` | How many past days are kept complete; at least 1. |
 | `--listen <ADDRESS>` | `XOSL_NEWSWEB_LISTEN` | `127.0.0.1:50051` | The address of the gRPC server. In a container, listen on `0.0.0.0:50051`. |
 | `--log-format <FORMAT>` | `XOSL_NEWSWEB_LOG_FORMAT` | `text` | How log lines are written: `text` or `json`. |
+| `--webhook-url <URL>` | `XOSL_NEWSWEB_WEBHOOK_URL` | none | Sends each event to this URL. See "Webhook". |
+| `--webhook-secret <SECRET>` | `XOSL_NEWSWEB_WEBHOOK_SECRET` | none | Signs each webhook request. |
 
 Days are Oslo calendar days. A past day is complete once a listing of it,
 made at least two hours after the day ended, was not truncated and decoded in
@@ -95,9 +94,8 @@ becomes unhealthy.
 
 `xosl-newsweb health` asks the server for its status and prints one line:
 `healthy` (exit code 0), `unhealthy` (exit code 1), or `unreachable: <cause>`
-(exit code 1) when the call fails within 5 seconds. `--address <ADDRESS>`
-(`XOSL_NEWSWEB_HEALTH_ADDRESS`, default `http://127.0.0.1:50051`) names the
-server. The release image has no shell and no curl, so Docker Compose runs
+(exit code 1) when the call fails within 5 seconds. `--address <URL>`
+(`XOSL_NEWSWEB_ADDRESS`, default `http://127.0.0.1:50051`) names the server. The release image has no shell and no curl, so Docker Compose runs
 the binary itself:
 
 ```yaml
@@ -105,6 +103,67 @@ healthcheck:
   test: ["CMD", "/xosl-newsweb", "health"]
   interval: 30s
   start_period: 60s
+```
+
+### Webhook
+
+With `--webhook-url` set, the mirror sends each event of its log to that URL
+as an HTTP POST, so another program can react to a new disclosure without
+holding a connection open.
+
+- **The body** is the event as JSON: its `seq`, its kind, and the disclosure
+  as it stood when the event was written. It is the JSON that `watch --json`
+  prints. 64-bit numbers, such as `seq` and `messageId`, are JSON strings.
+- **Headers:** `Content-Type: application/json` and `X-Xosl-Newsweb-Seq`
+  with the event's `seq`.
+- **Order:** one event at a time, in `seq` order. The next event is sent
+  only after the receiver answered the current one with a 2xx status.
+- **Retries:** a delivery that fails is tried again after 1 second, then
+  with the delay doubled each time, up to 5 minutes, until it succeeds. No
+  event is skipped, so a receiver that is down delays every later event. A
+  retry can deliver an event twice; a receiver can tell by the `seq`.
+- **Start:** the first time a webhook is set, delivery starts with the next
+  event, not with the events already in the log. The position is stored, so
+  a restart continues where it stopped.
+- **Signature:** with `--webhook-secret` set, each request carries
+  `X-Xosl-Newsweb-Signature: sha256=<hex>`, the HMAC-SHA256 of the body under
+  the secret. A receiver that computes the same value knows the request came
+  from the mirror.
+
+## Commands
+
+The same binary calls a running mirror and prints the answer.
+
+| Command | What it does |
+|---|---|
+| `list [--from <TIME>] [--before <TIME>] [--sign <SIGN>]... [--limit <N>]` | Prints the disclosures in a time range, newest first: time, message id, issuer sign, title. `--limit` stops after N. |
+| `get <MESSAGE_ID>` | Prints one disclosure: its fields, its attachments and its body. |
+| `attachment <MESSAGE_ID> <ATTACHMENT_ID> [--output <FILE>]` | Writes an attachment's bytes to the file, or to stdout. |
+| `watch [--since <SEQ>]` | Prints events as they are written, until interrupted. Without `--since` it starts after the latest event; `--since 0` replays the whole log. |
+| `status` | Prints the version, the counts, the days known to be complete and each job's last success and failure. |
+| `failures [--message-id <ID>] [--limit <N>]` | Prints the failure log, newest first. |
+| `health` | Prints `healthy` or `unhealthy`; see Health. |
+
+Every command takes `--address <URL>` (`XOSL_NEWSWEB_ADDRESS`, default
+`http://127.0.0.1:50051`), the address of the mirror's gRPC server. Every
+command except `attachment` and `health` takes `--json`: one proto-JSON
+object per line on stdout (a disclosure, an event, a status or a failure),
+and nothing else. Without it the output is text, with times as RFC 3339 in
+UTC.
+
+`<TIME>` is an RFC 3339 timestamp (`2026-11-16T08:00:00Z`) or a date
+(`2026-11-16`), which means the start of that day in Oslo. `--from` is
+inclusive and `--before` is exclusive.
+
+A failed call prints one line on stderr with the status code and the
+server's message, for example `not found: no disclosure 12`, and exits with
+1. A mirror that cannot be reached prints `unreachable: <cause>` and exits
+with 1.
+
+```
+xosl-newsweb list --sign EQNR --from 2026-11-01
+xosl-newsweb attachment 654321 7 --output report.pdf
+xosl-newsweb watch --json
 ```
 
 ## Logging
