@@ -93,6 +93,7 @@ defaults keep the load low:
    ```
    just check     # format, clippy, buf lint, tests: what every pull request must pass
    just gen       # regenerate the Rust code after changing a .proto file
+   just test-live # the tests that call the real exchange; never run by the gate
    just build     # the release binary, in target/release/
    ```
 

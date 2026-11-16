@@ -9,6 +9,16 @@ syntax = "proto3";
 // default.
 package com.vizroy.xosl.newsweb.raw.v1;
 
+// `urls.json` on the NewsWeb website: where the exchange publishes the address
+// of its API. The website's own client reads it before every session.
+message Urls {
+  string version = 1;
+  string build_time = 2;
+  // The base URL of the API.
+  string api_large = 3;
+  string public_url = 4;
+}
+
 // Every response is an envelope of `header` and `data`.
 message Header {
   // The status that counts. A failure can arrive under HTTP 200.

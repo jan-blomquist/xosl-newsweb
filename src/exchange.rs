@@ -14,8 +14,10 @@
 //!   instrument and regulatory flags read as zero whatever their real values.
 //!   Only `message` returns them.
 
-// Nothing calls this module until the HTTP client is added.
+// Nothing calls this module until ingest is added.
 #![allow(dead_code)]
+
+pub mod client;
 
 use jiff::Timestamp;
 use jiff::civil::Date;
@@ -42,6 +44,8 @@ pub enum DecodeError {
     NoData,
     #[error("the exchange sent a disclosure without a message id")]
     NoMessageId,
+    #[error("urls.json names {value:?} as the API base, which is not an https URL")]
+    ApiBase { value: String },
     #[error("message {message_id}: publication time {value:?} is not a timestamp")]
     PublishedTime { message_id: i64, value: String },
 }
@@ -58,6 +62,21 @@ impl DecodeError {
             }
         )
     }
+}
+
+/// Where the exchange publishes the address of its API.
+pub const URLS_JSON: &str = "https://newsweb.oslobors.no/urls.json";
+
+/// Decodes `urls.json` into the API's base URL, without a trailing slash.
+pub fn decode_api_base(body: &[u8]) -> Result<String, DecodeError> {
+    let urls: raw::Urls = decode_json(body)?;
+    let api_base = urls.api_large.trim_end_matches('/');
+    if !api_base.starts_with("https://") {
+        return Err(DecodeError::ApiBase {
+            value: urls.api_large,
+        });
+    }
+    Ok(api_base.to_owned())
 }
 
 /// The URL that lists the disclosures of one Oslo calendar day.
@@ -252,6 +271,32 @@ mod tests {
     fn message_response(message: &str) -> Vec<u8> {
         format!(r#"{{"header": {{"http.code": 200}}, "data": {{"message": {message}}}}}"#)
             .into_bytes()
+    }
+
+    #[test]
+    fn decode_api_base__urls_json_names_host__returns_it_without_trailing_slash() {
+        let body =
+            br#"{"version": "3.13.5", "api_large": "https://api.example/", "public_url": ""}"#;
+
+        let api_base = decode_api_base(body).unwrap();
+
+        assert_eq!(api_base, "https://api.example");
+    }
+
+    #[test]
+    fn decode_api_base__base_not_https__fails_naming_value() {
+        let body = br#"{"api_large": "http://api.example"}"#;
+
+        let error = decode_api_base(body).unwrap_err();
+
+        assert!(error.to_string().contains(r#""http://api.example""#));
+    }
+
+    #[test]
+    fn decode_api_base__api_large_missing__fails() {
+        let error = decode_api_base(br#"{"version": "3.13.5"}"#).unwrap_err();
+
+        assert!(matches!(error, DecodeError::ApiBase { .. }));
     }
 
     #[test]
