@@ -83,6 +83,42 @@ pub struct Failure {
     pub detail: String,
 }
 
+/// Whether a disclosure or an attachment is tried again after a recorded
+/// failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retry {
+    /// The next try is not before this instant, in nanoseconds since
+    /// 1970-01-01 UTC.
+    At { at_ns: i64 },
+    /// It is not tried again: it is marked failed.
+    Never,
+}
+
+impl Retry {
+    fn after(next: &AfterFailure, already_failed: bool) -> Self {
+        if next.exhausted || already_failed {
+            Self::Never
+        } else {
+            Self::At {
+                at_ns: next.retry_after_ns,
+            }
+        }
+    }
+}
+
+/// The sizes of the queues of the jobs, and the counts of what failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, sqlx::FromRow)]
+pub struct QueueSizes {
+    /// Disclosures to read in full, whatever their next try's time.
+    pub unread_disclosures: i64,
+    /// Attachments in state PENDING, whatever their next try's time.
+    pub pending_attachments: i64,
+    /// Disclosures marked failed, which are not read again.
+    pub failed_disclosures: i64,
+    /// Attachments in state FAILED.
+    pub failed_attachments: i64,
+}
+
 /// What a failed attempt was for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureStage {
@@ -366,22 +402,23 @@ impl Store {
 
     /// Logs a failed full read and delays the next one. The
     /// `MAX_PERMANENT_FAILURES`th permanent failure marks the disclosure
-    /// failed; transient failures never do.
+    /// failed; transient failures never do. Returns when the disclosure is
+    /// tried again, or `Retry::Never` once it is marked failed.
     pub async fn record_read_failure(
         &self,
         message_id: i64,
         failure: &Failure,
         now_ns: i64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Retry, StoreError> {
         let mut tx = self.pool.begin().await?;
-        let counts: Option<RetryCounts> = sqlx::query_as(
-            "SELECT attempts, transient_failures FROM disclosures WHERE message_id = ?",
+        let counts: Option<DisclosureRetryCounts> = sqlx::query_as(
+            "SELECT failed, attempts, transient_failures FROM disclosures WHERE message_id = ?",
         )
         .bind(message_id)
         .fetch_optional(&mut *tx)
         .await?;
         let counts = counts.ok_or(StoreError::NoDisclosure { message_id })?;
-        let next = after_failure(counts, failure.permanent, now_ns);
+        let next = after_failure(counts.counts, failure.permanent, now_ns);
         sqlx::query(
             "UPDATE disclosures
                 SET attempts = ?, transient_failures = ?, retry_after_ns = ?,
@@ -407,20 +444,22 @@ impl Store {
         };
         insert_failure(&mut tx, &entry, now_ns).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(Retry::after(&next, counts.failed))
     }
 
     /// Logs a failed download and delays the next one. The
     /// `MAX_PERMANENT_FAILURES`th permanent failure sets the attachment's
     /// state to FAILED and writes `ATTACHMENT_FAILED`, as
-    /// `mark_attachment_failed` does; transient failures never do.
+    /// `mark_attachment_failed` does; transient failures never do. Returns
+    /// when the attachment is tried again, or `Retry::Never` once its state
+    /// is FAILED.
     pub async fn record_attachment_failure(
         &self,
         message_id: i64,
         attachment_id: i64,
         failure: &Failure,
         now_ns: i64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Retry, StoreError> {
         let mut tx = self.pool.begin().await?;
         let counts: Option<AttachmentRetryCounts> = sqlx::query_as(
             "SELECT state, attempts, transient_failures FROM attachments
@@ -464,7 +503,26 @@ impl Store {
         };
         insert_failure(&mut tx, &entry, now_ns).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(Retry::after(&next, already_failed))
+    }
+
+    /// The sizes of the queues of `reader` and `downloader`, and the counts
+    /// of disclosures and attachments marked failed.
+    pub async fn queue_sizes(&self) -> Result<QueueSizes, StoreError> {
+        // The first two conditions repeat the WHERE clauses of the indexes
+        // `disclosures_unread` and `attachments_pending`; 1 is PENDING and 3
+        // is FAILED.
+        let sizes = sqlx::query_as(
+            "SELECT
+               (SELECT count(*) FROM disclosures
+                 WHERE (read_in_full = 0 OR reread = 1) AND failed = 0) AS unread_disclosures,
+               (SELECT count(*) FROM attachments WHERE state = 1) AS pending_attachments,
+               (SELECT count(*) FROM disclosures WHERE failed = 1) AS failed_disclosures,
+               (SELECT count(*) FROM attachments WHERE state = 3) AS failed_attachments",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(sizes)
     }
 
     /// Logs a failure to list one Oslo calendar day.
@@ -766,6 +824,14 @@ fn after_failure(current: RetryCounts, permanent: bool, now_ns: i64) -> AfterFai
 struct StoredDocument {
     read_in_full: bool,
     document: String,
+}
+
+/// The failure counters of a disclosure, and whether it is marked failed.
+#[derive(Debug, sqlx::FromRow)]
+struct DisclosureRetryCounts {
+    failed: bool,
+    #[sqlx(flatten)]
+    counts: RetryCounts,
 }
 
 /// The failure counters of an attachment, and its state.

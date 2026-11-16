@@ -64,6 +64,7 @@ lists them.
 | `--request-interval-ms <N>` | `XOSL_NEWSWEB_REQUEST_INTERVAL_MS` | `1000` | The shortest time between two requests to the exchange; at least 1000. |
 | `--poll-interval-secs <N>` | `XOSL_NEWSWEB_POLL_INTERVAL_SECS` | `60` | How often today is listed; at least 1. |
 | `--lookback-days <N>` | `XOSL_NEWSWEB_LOOKBACK_DAYS` | `7` | How many past days are kept complete; at least 1. |
+| `--log-format <FORMAT>` | `XOSL_NEWSWEB_LOG_FORMAT` | `text` | How log lines are written: `text` or `json`. |
 
 Days are Oslo calendar days. A past day is complete once a listing of it,
 made at least two hours after the day ended, was not truncated and decoded in
@@ -75,11 +76,28 @@ The data folder holds:
   `mirror.sqlite-wal` and `mirror.sqlite-shm` beside it.
 - `attachments/<message id>/<attachment id>`: the bytes of each attachment.
 
-Log lines go to stderr. `RUST_LOG` sets the level; the default is `info`.
-
 Out of scope: search, text extraction, classification and anything else
 derived from the disclosures. Those belong in the programs that consume the
 mirror.
+
+## Logging
+
+Log lines go to stderr. There are four levels:
+
+| Level | Meaning |
+|---|---|
+| `error` | The mirror cannot do part of its work and needs a person: the database or the attachment folder cannot be written, start-up failed, a disclosure or an attachment will not be tried again. |
+| `warn` | One attempt failed and will be made again: a listing, a read, a download, a retry of a request, a truncated list. |
+| `info` | Normal progress: start-up with the settings, coverage, a pass that did work, the periodic status, shutdown. |
+| `debug` | Detail of each request to the exchange. |
+
+`RUST_LOG` sets the level; the default is `info`. `RUST_LOG=debug` shows
+every request, with its URL, result and duration.
+
+`--log-format text` writes one readable line per event. It is coloured only
+when stderr is a terminal, so a container log has no escape sequences.
+`--log-format json` writes one JSON object per line, with the timestamp,
+level, target and the event's message and fields.
 
 ## The API
 

@@ -326,12 +326,7 @@ struct Fixture {
 
 impl Fixture {
     fn jobs(&self) -> Jobs<'_, FakeExchange, FakeClock> {
-        Jobs {
-            store: &self.store,
-            files: &self.files,
-            exchange: &self.exchange,
-            clock: &self.clock,
-        }
+        Jobs::new(&self.store, &self.files, &self.exchange, &self.clock)
     }
 }
 
@@ -1055,4 +1050,32 @@ async fn run_mirror__ingest_on_with_one_disclosure_and_attachment__reads_it_and_
         (disclosure.read_in_full, disclosure.attachments[0].state),
         (true, attachment::State::Stored as i32)
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn run__poller_lists_a_disclosure_with_an_attachment__stores_the_attachment_within_one_interval()
+ {
+    let exchange = FakeExchange::new()
+        .with_list(
+            TODAY,
+            vec![Reply::Ok(page(vec![list_row(1, PUBLISHED_TODAY)]))],
+        )
+        .with_message(1, vec![Reply::Ok(full_message(1, PUBLISHED_TODAY, &[9]))])
+        .with_attachment(1, 9, vec![Reply::Ok(Bytes::from_static(ABC))]);
+    let fixture = paused_fixture(exchange).await;
+    let settings = JobSettings {
+        poll_interval: ONE_HOUR,
+        lookback_days: 0,
+    };
+    let shutdown = CancellationToken::new();
+    let jobs = fixture.jobs();
+    let start = Instant::now();
+
+    tokio::join!(
+        jobs.run(&settings, &shutdown),
+        cancel_once_stored(&fixture.store, 1, &shutdown),
+    );
+
+    let elapsed = start.elapsed();
+    assert!(elapsed < ONE_HOUR, "stored after {elapsed:?}");
 }

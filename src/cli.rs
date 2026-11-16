@@ -3,7 +3,6 @@
 //! Each setting is a flag and an environment variable, defined once here;
 //! `--help` lists them.
 
-use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -11,14 +10,13 @@ use std::time::Duration;
 use clap::builder::BoolishValueParser;
 use clap::{Args, Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::filter::LevelFilter;
 use url::Url;
 
 use crate::clock::{Clock, SystemClock};
 use crate::exchange::client::{Client, Exchange, HttpTransport};
 use crate::files::{Files, FilesError};
 use crate::ingest::{self, JobSettings, Jobs};
+use crate::logging::{self, InitError, LogFormat};
 use crate::store::{Store, StoreError};
 
 /// The database file, in the data folder.
@@ -90,6 +88,17 @@ pub struct RunSettings {
         value_parser = lookback_days
     )]
     pub lookback_days: u32,
+
+    /// How log lines are written to stderr: text, or one JSON object per
+    /// line. The level is set by RUST_LOG; the default is info.
+    #[arg(
+        long,
+        env = "XOSL_NEWSWEB_LOG_FORMAT",
+        value_name = "FORMAT",
+        value_enum,
+        default_value_t
+    )]
+    pub log_format: LogFormat,
 }
 
 /// The largest `--lookback-days`: a hundred years. A larger value is a
@@ -147,8 +156,8 @@ pub struct MirrorSettings {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
-    #[error("cannot set up logging")]
-    Logging(#[source] Box<dyn Error + Send + Sync>),
+    #[error(transparent)]
+    Logging(InitError),
     #[error("cannot create the data folder {path:?}")]
     DataDir {
         path: PathBuf,
@@ -176,28 +185,52 @@ pub async fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("error: {}", error_chain(&error));
+            // Any other error is already in the log.
+            if let RunError::Logging(error) = &error {
+                eprintln!("error: {}", logging::chain(error));
+            }
             ExitCode::FAILURE
         }
     }
 }
 
 /// The `run` command: sets up logging, opens the store and the files, and
-/// runs the mirror until SIGINT or SIGTERM.
+/// runs the mirror until SIGINT or SIGTERM. A failure after logging is set
+/// up is logged at `error` and returned.
 pub async fn run(settings: &RunSettings) -> Result<(), RunError> {
-    init_logging()?;
+    logging::init(settings.log_format).map_err(RunError::Logging)?;
+    log_start(settings);
+    let result = run_logged(settings).await;
+    if let Err(error) = &result {
+        tracing::error!(error = %logging::chain(error), "the mirror stopped");
+    }
+    result
+}
+
+/// The `info` line with the version and every setting.
+fn log_start(settings: &RunSettings) {
+    let data_dir =
+        std::path::absolute(&settings.data_dir).unwrap_or_else(|_| settings.data_dir.clone());
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        data_dir = %data_dir.display(),
+        ingest = settings.ingest,
+        request_interval_ms = settings.request_interval_ms,
+        poll_interval_secs = settings.poll_interval_secs,
+        lookback_days = settings.lookback_days,
+        log_format = %settings.log_format,
+        "starting"
+    );
+}
+
+async fn run_logged(settings: &RunSettings) -> Result<(), RunError> {
     let layout = open_data_dir(&settings.data_dir)?;
     let store = Store::open(&layout.database).await?;
     let files = Files::open(layout.attachments.as_str(), [])?;
     // Creating the client sends no request; with ingest off it is not used.
     let transport = HttpTransport::new().map_err(RunError::Http)?;
     let client = Client::new(transport, settings.request_interval());
-    let jobs = Jobs {
-        store: &store,
-        files: &files,
-        exchange: &client,
-        clock: &SystemClock,
-    };
+    let jobs = Jobs::new(&store, &files, &client, &SystemClock);
 
     let mirror_settings = settings.mirror_settings();
     let shutdown = CancellationToken::new();
@@ -267,18 +300,6 @@ fn open_data_dir(dir: &Path) -> Result<DataLayout, RunError> {
     data_layout(&absolute_dir)
 }
 
-/// Log lines go to stderr, at the level `RUST_LOG` sets; `info` by default.
-fn init_logging() -> Result<(), RunError> {
-    let filter = EnvFilter::builder()
-        .with_default_directive(LevelFilter::INFO.into())
-        .from_env_lossy();
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(filter)
-        .try_init()
-        .map_err(RunError::Logging)
-}
-
 /// Waits for SIGINT or SIGTERM.
 async fn shutdown_signal() -> std::io::Result<()> {
     #[cfg(unix)]
@@ -294,18 +315,6 @@ async fn shutdown_signal() -> std::io::Result<()> {
     {
         tokio::signal::ctrl_c().await
     }
-}
-
-/// An error and its sources, separated by colons.
-fn error_chain(error: &dyn Error) -> String {
-    let mut text = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        text.push_str(": ");
-        text.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    text
 }
 
 #[cfg(test)]
@@ -337,6 +346,7 @@ mod tests {
             request_interval_ms: 1000,
             poll_interval_secs: 60,
             lookback_days: 7,
+            log_format: LogFormat::Text,
         };
         assert_eq!(settings, expected);
     }
@@ -353,6 +363,8 @@ mod tests {
             "5",
             "--lookback-days",
             "30",
+            "--log-format",
+            "json",
         ];
 
         let settings = parse(&args).unwrap();
@@ -363,6 +375,7 @@ mod tests {
             request_interval_ms: 1500,
             poll_interval_secs: 5,
             lookback_days: 30,
+            log_format: LogFormat::Json,
         };
         assert_eq!(settings, expected);
     }
@@ -455,18 +468,5 @@ mod tests {
         let error = data_layout(Path::new("data")).unwrap_err();
 
         assert!(matches!(error, RunError::AttachmentsUrl { .. }));
-    }
-
-    #[derive(Debug, thiserror::Error)]
-    #[error("outer")]
-    struct Outer(#[source] std::io::Error);
-
-    #[test]
-    fn error_chain__error_with_a_source__joins_both_with_a_colon() {
-        let error = Outer(std::io::Error::other("inner"));
-
-        let text = error_chain(&error);
-
-        assert_eq!(text, "outer: inner");
     }
 }

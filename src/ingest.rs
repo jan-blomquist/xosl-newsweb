@@ -12,15 +12,21 @@
 //!
 //! The decisions are pure functions at the top of this file; the jobs are the
 //! I/O around them. Each job is a pass, which does one round of work, and a
-//! loop that repeats the pass until a `CancellationToken` is cancelled.
+//! loop that repeats the pass until a `CancellationToken` is cancelled. A
+//! pass of `poller` or `backfiller` that stores a new disclosure starts the
+//! next pass of `reader` at once; a pass of `reader` that stores a message
+//! does the same for `downloader`. `JobStates` records what each job did
+//! last, and a fifth loop logs it with the sizes of the queues once an hour.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use jiff::Span;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
+use tokio::sync::Notify;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -28,7 +34,8 @@ use crate::clock::Clock;
 use crate::exchange::client::{ClientError, Exchange};
 use crate::exchange::{self, Fetched, Page};
 use crate::files::Files;
-use crate::store::{AttachmentRef, Failure, ListedDay, Store, StoreError, StoredFile};
+use crate::logging::chain;
+use crate::store::{AttachmentRef, Failure, ListedDay, Retry, Store, StoreError, StoredFile};
 
 /// The names of the jobs, as the logs give them.
 pub const POLLER: &str = "poller";
@@ -46,6 +53,9 @@ pub const SEALING_GRACE_NS: i64 = 2 * HOUR_NS;
 /// How old a listing that started after the day's sealing time, and still
 /// did not seal it, must be before the day is listed again.
 pub const RELIST_AFTER_NS: i64 = 24 * HOUR_NS;
+
+/// How often the status line with the sizes of the queues is logged.
+pub const STATUS_INTERVAL: Duration = Duration::from_secs(3_600);
 
 /// The disclosures, or attachments, that one pass of `reader`, or
 /// `downloader`, takes from its queue.
@@ -288,16 +298,156 @@ pub struct JobSettings {
     pub lookback_days: u32,
 }
 
+/// One of the four jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Job {
+    Poller,
+    Backfiller,
+    Reader,
+    Downloader,
+}
+
+impl Job {
+    /// The name of the job, as the logs give it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Poller => POLLER,
+            Self::Backfiller => BACKFILLER,
+            Self::Reader => READER,
+            Self::Downloader => DOWNLOADER,
+        }
+    }
+}
+
+/// A failure of a job: of a request to the exchange, of a write of a file
+/// or of the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobFailure {
+    pub at_ns: i64,
+    pub detail: String,
+}
+
+/// What one job did last. Times are nanoseconds since 1970-01-01 UTC; `None`
+/// when it has not happened since start-up.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobState {
+    /// When the last pass ended.
+    pub last_pass_ended_ns: Option<i64>,
+    /// When the job last did its work: a listing for `poller` and
+    /// `backfiller`, a disclosure read in full for `reader`, an attachment
+    /// stored for `downloader`.
+    pub last_success_ns: Option<i64>,
+    pub last_failure: Option<JobFailure>,
+}
+
+/// The state of each job at one instant.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobStatesSnapshot {
+    pub poller: JobState,
+    pub backfiller: JobState,
+    pub reader: JobState,
+    pub downloader: JobState,
+}
+
+impl JobStatesSnapshot {
+    /// The state of `job`.
+    pub fn job(&self, job: Job) -> &JobState {
+        match job {
+            Job::Poller => &self.poller,
+            Job::Backfiller => &self.backfiller,
+            Job::Reader => &self.reader,
+            Job::Downloader => &self.downloader,
+        }
+    }
+
+    fn job_mut(&mut self, job: Job) -> &mut JobState {
+        match job {
+            Job::Poller => &mut self.poller,
+            Job::Backfiller => &mut self.backfiller,
+            Job::Reader => &mut self.reader,
+            Job::Downloader => &mut self.downloader,
+        }
+    }
+}
+
+/// The state of each job, in memory. The jobs update it as they work; any
+/// task can read it with `snapshot`.
+#[derive(Debug, Default)]
+pub struct JobStates(Mutex<JobStatesSnapshot>);
+
+impl JobStates {
+    /// A copy of the state of each job.
+    pub fn snapshot(&self) -> JobStatesSnapshot {
+        self.lock().clone()
+    }
+
+    /// Records that a pass of `job` ended at `at_ns`.
+    pub fn record_pass_end(&self, job: Job, at_ns: i64) {
+        self.lock().job_mut(job).last_pass_ended_ns = Some(at_ns);
+    }
+
+    /// Records that `job` did its work at `at_ns`.
+    pub fn record_success(&self, job: Job, at_ns: i64) {
+        self.lock().job_mut(job).last_success_ns = Some(at_ns);
+    }
+
+    /// Records a failure of `job` at `at_ns`.
+    pub fn record_failure(&self, job: Job, at_ns: i64, detail: String) {
+        self.lock().job_mut(job).last_failure = Some(JobFailure { at_ns, detail });
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, JobStatesSnapshot> {
+        // Every update is one assignment, so the value is whole even after a
+        // panic while the lock was held.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// An instant as an RFC 3339 UTC timestamp; "never" for `None`.
+fn format_instant(at_ns: Option<i64>) -> String {
+    match at_ns.map(|ns| jiff::Timestamp::from_nanosecond(i128::from(ns))) {
+        None => "never".to_owned(),
+        Some(Ok(timestamp)) => timestamp.to_string(),
+        Some(Err(_)) => format!("{} ns", at_ns.unwrap_or_default()),
+    }
+}
+
 /// The four jobs and what they work with.
 pub struct Jobs<'a, E, C> {
     pub store: &'a Store,
     pub files: &'a Files,
     pub exchange: &'a E,
     pub clock: &'a C,
+    states: Arc<JobStates>,
+    /// Starts the next pass of `reader` without waiting for its interval.
+    read_wakeup: Notify,
+    /// Starts the next pass of `downloader` without waiting for its interval.
+    download_wakeup: Notify,
+}
+
+impl<'a, E, C> Jobs<'a, E, C> {
+    /// The jobs, with every job's state empty.
+    pub fn new(store: &'a Store, files: &'a Files, exchange: &'a E, clock: &'a C) -> Self {
+        Self {
+            store,
+            files,
+            exchange,
+            clock,
+            states: Arc::default(),
+            read_wakeup: Notify::new(),
+            download_wakeup: Notify::new(),
+        }
+    }
+
+    /// The state of each job, which the jobs update as they work.
+    pub fn states(&self) -> &Arc<JobStates> {
+        &self.states
+    }
 }
 
 impl<E: Exchange, C: Clock> Jobs<'_, E, C> {
-    /// Runs the four jobs until `shutdown` is cancelled.
+    /// Runs the four jobs, and the status line once every
+    /// `STATUS_INTERVAL`, until `shutdown` is cancelled.
     pub async fn run(&self, settings: &JobSettings, shutdown: &CancellationToken) {
         let interval = settings.poll_interval;
         tokio::join!(
@@ -305,7 +455,61 @@ impl<E: Exchange, C: Clock> Jobs<'_, E, C> {
             self.run_backfiller(settings, shutdown),
             self.run_reader(interval, shutdown),
             self.run_downloader(interval, shutdown),
+            self.run_status(STATUS_INTERVAL, shutdown),
         );
+    }
+
+    /// Logs the sizes of the queues and the time of each job's last success
+    /// once every `interval`, the first time one `interval` after the start,
+    /// until `shutdown` is cancelled.
+    pub async fn run_status(&self, interval: Duration, shutdown: &CancellationToken) {
+        loop {
+            let waited = shutdown
+                .run_until_cancelled(tokio::time::sleep(interval))
+                .await;
+            if waited.is_none() {
+                return;
+            }
+            let Some(read) = shutdown.run_until_cancelled(self.store.queue_sizes()).await else {
+                return;
+            };
+            let sizes = match read {
+                Ok(sizes) => sizes,
+                Err(error) => {
+                    tracing::error!(error = %chain(&error), "status: the store cannot be read");
+                    continue;
+                }
+            };
+            let jobs = self.states.snapshot();
+            tracing::info!(
+                unread_disclosures = sizes.unread_disclosures,
+                pending_attachments = sizes.pending_attachments,
+                failed_disclosures = sizes.failed_disclosures,
+                failed_attachments = sizes.failed_attachments,
+                poller_last_success = %format_instant(jobs.poller.last_success_ns),
+                backfiller_last_success = %format_instant(jobs.backfiller.last_success_ns),
+                reader_last_success = %format_instant(jobs.reader.last_success_ns),
+                downloader_last_success = %format_instant(jobs.downloader.last_success_ns),
+                "status"
+            );
+        }
+    }
+
+    /// Runs `pass` of `job`, then records the end of the pass, and the store
+    /// error that ended it, in the job's state.
+    async fn recorded_pass<T>(
+        &self,
+        job: Job,
+        pass: impl Future<Output = Result<T, StoreError>>,
+    ) -> Result<T, StoreError> {
+        let result = pass.await;
+        let now_ns = self.clock.now_ns();
+        if let Err(error) = &result {
+            let detail = chain(error).to_string();
+            self.states.record_failure(job, now_ns, detail);
+        }
+        self.states.record_pass_end(job, now_ns);
+        result
     }
 
     /// Runs a pass of `poller` once every `interval` until `shutdown` is
@@ -313,7 +517,8 @@ impl<E: Exchange, C: Clock> Jobs<'_, E, C> {
     pub async fn run_poller(&self, interval: Duration, shutdown: &CancellationToken) {
         loop {
             let next = Instant::now() + interval;
-            let Some(result) = shutdown.run_until_cancelled(self.poller_pass()).await else {
+            let pass = self.recorded_pass(Job::Poller, self.poller_pass());
+            let Some(result) = shutdown.run_until_cancelled(pass).await else {
                 return;
             };
             if let Err(error) = result {
@@ -330,20 +535,39 @@ impl<E: Exchange, C: Clock> Jobs<'_, E, C> {
 
     /// Runs passes of `backfiller` until `shutdown` is cancelled.
     pub async fn run_backfiller(&self, settings: &JobSettings, shutdown: &CancellationToken) {
-        repeat(BACKFILLER, settings.poll_interval, shutdown, || {
-            self.backfiller_pass(settings.lookback_days)
-        })
+        // No other job starts a pass of `backfiller`.
+        let wakeup = Notify::new();
+        repeat(
+            BACKFILLER,
+            settings.poll_interval,
+            &wakeup,
+            shutdown,
+            || {
+                let pass = self.backfiller_pass(settings.lookback_days);
+                self.recorded_pass(Job::Backfiller, pass)
+            },
+        )
         .await;
     }
 
     /// Runs passes of `reader` until `shutdown` is cancelled.
     pub async fn run_reader(&self, interval: Duration, shutdown: &CancellationToken) {
-        repeat(READER, interval, shutdown, || self.reader_pass()).await;
+        repeat(READER, interval, &self.read_wakeup, shutdown, || {
+            self.recorded_pass(Job::Reader, self.reader_pass())
+        })
+        .await;
     }
 
     /// Runs passes of `downloader` until `shutdown` is cancelled.
     pub async fn run_downloader(&self, interval: Duration, shutdown: &CancellationToken) {
-        repeat(DOWNLOADER, interval, shutdown, || self.downloader_pass()).await;
+        repeat(
+            DOWNLOADER,
+            interval,
+            &self.download_wakeup,
+            shutdown,
+            || self.recorded_pass(Job::Downloader, self.downloader_pass()),
+        )
+        .await;
     }
 
     /// Lists today with one request and stores every entry. It lists no
@@ -354,19 +578,21 @@ impl<E: Exchange, C: Clock> Jobs<'_, E, C> {
         let page = match self.exchange.list(today).await {
             Ok(page) => page,
             Err(error) => {
-                tracing::warn!(job = POLLER, day = %today, %error, "listing failed");
+                tracing::warn!(job = POLLER, day = %today, error = %chain(&error), "listing failed");
+                let detail = error.to_string();
                 let now_ns = self.clock.now_ns();
-                return self
-                    .store
-                    .record_list_failure(today, &error.to_string(), now_ns)
-                    .await;
+                self.states
+                    .record_failure(Job::Poller, now_ns, detail.clone());
+                return self.store.record_list_failure(today, &detail, now_ns).await;
             }
         };
         if let Some(detail) = incomplete_listing(&page) {
             tracing::warn!(job = POLLER, day = %today, detail, "listing incomplete");
         }
         let new = self.store_entries(&page.entries).await?;
+        self.states.record_success(Job::Poller, self.clock.now_ns());
         if new > 0 {
+            self.read_wakeup.notify_one();
             tracing::info!(
                 job = POLLER,
                 day = %today,
@@ -399,6 +625,9 @@ impl<E: Exchange, C: Clock> Jobs<'_, E, C> {
             rows += listing.day.rows;
             new += listing.new;
         }
+        if new > 0 {
+            self.read_wakeup.notify_one();
+        }
         if days > 0 {
             tracing::info!(
                 job = BACKFILLER,
@@ -418,11 +647,12 @@ impl<E: Exchange, C: Clock> Jobs<'_, E, C> {
         let page = match self.exchange.list(day).await {
             Ok(page) => page,
             Err(error) => {
-                tracing::warn!(job = BACKFILLER, %day, %error, "listing failed");
+                tracing::warn!(job = BACKFILLER, %day, error = %chain(&error), "listing failed");
+                let detail = error.to_string();
                 let now_ns = self.clock.now_ns();
-                self.store
-                    .record_list_failure(day, &error.to_string(), now_ns)
-                    .await?;
+                self.states
+                    .record_failure(Job::Backfiller, now_ns, detail.clone());
+                self.store.record_list_failure(day, &detail, now_ns).await?;
                 return Ok(None);
             }
         };
@@ -434,6 +664,8 @@ impl<E: Exchange, C: Clock> Jobs<'_, E, C> {
         }
         let listing = listed_day(day, started_at_ns, &page);
         self.store.record_listed_day(&listing).await?;
+        self.states
+            .record_success(Job::Backfiller, self.clock.now_ns());
         Ok(Some(Backfilled { day: listing, new }))
     }
 
@@ -459,24 +691,25 @@ impl<E: Exchange, C: Clock> Jobs<'_, E, C> {
                 Ok(message) => {
                     let now_ns = self.clock.now_ns();
                     self.store.store_message(&message, now_ns).await?;
+                    self.states.record_success(Job::Reader, now_ns);
                 }
                 Err(failure) => {
                     failed += 1;
-                    tracing::warn!(
-                        job = READER,
-                        message_id,
-                        permanent = failure.permanent,
-                        detail = failure.detail,
-                        "reading failed"
-                    );
                     let now_ns = self.clock.now_ns();
-                    self.store
+                    self.states
+                        .record_failure(Job::Reader, now_ns, failure.detail.clone());
+                    let retry = self
+                        .store
                         .record_read_failure(message_id, &failure, now_ns)
                         .await?;
+                    log_read_failure(message_id, &failure, retry);
                 }
             }
         }
         let tried = message_ids.len();
+        if tried > failed {
+            self.download_wakeup.notify_one();
+        }
         if tried > 0 {
             let read = tried - failed;
             tracing::info!(job = READER, tried, read, failed, "read disclosures");
@@ -522,21 +755,18 @@ impl<E: Exchange, C: Clock> Jobs<'_, E, C> {
                     self.store
                         .mark_attachment_stored(message_id, attachment_id, &file, now_ns)
                         .await?;
+                    self.states.record_success(Job::Downloader, now_ns);
                 }
                 Err(failure) => {
                     failed += 1;
-                    tracing::warn!(
-                        job = DOWNLOADER,
-                        message_id,
-                        attachment_id,
-                        permanent = failure.permanent,
-                        detail = failure.detail,
-                        "download failed"
-                    );
                     let now_ns = self.clock.now_ns();
-                    self.store
+                    self.states
+                        .record_failure(Job::Downloader, now_ns, failure.detail.clone());
+                    let retry = self
+                        .store
                         .record_attachment_failure(message_id, attachment_id, &failure, now_ns)
                         .await?;
+                    log_download_failure(message_id, attachment_id, &failure, retry);
                 }
             }
         }
@@ -564,9 +794,19 @@ impl<E: Exchange, C: Clock> Jobs<'_, E, C> {
         self.files
             .put(message_id, attachment_id, bytes)
             .await
-            .map_err(|error| Failure {
-                permanent: false,
-                detail: error.to_string(),
+            .map_err(|error| {
+                let detail = chain(&error).to_string();
+                tracing::error!(
+                    job = DOWNLOADER,
+                    message_id,
+                    attachment_id,
+                    error = detail,
+                    "the attachment's file cannot be written"
+                );
+                Failure {
+                    permanent: false,
+                    detail,
+                }
             })
     }
 }
@@ -579,11 +819,18 @@ struct Backfilled {
 }
 
 /// Repeats `pass` until `shutdown` is cancelled: at once after a pass that
-/// did work, after `interval` when a pass found none or failed. A pass in
-/// progress is dropped at cancellation; every write of the store is one
-/// transaction, so a dropped pass leaves the store consistent.
-async fn repeat<F, Pass>(job: &str, interval: Duration, shutdown: &CancellationToken, mut pass: F)
-where
+/// did work, after `interval` or at the next `wakeup`, whichever comes
+/// first, when a pass found none or failed. A `notify_one` on `wakeup`
+/// during a pass ends the next wait at once. A pass in progress is dropped
+/// at cancellation; every write of the store is one transaction, so a
+/// dropped pass leaves the store consistent.
+async fn repeat<F, Pass>(
+    job: &str,
+    interval: Duration,
+    wakeup: &Notify,
+    shutdown: &CancellationToken,
+    mut pass: F,
+) where
     F: FnMut() -> Pass,
     Pass: Future<Output = Result<usize, StoreError>>,
 {
@@ -601,17 +848,62 @@ where
         if did_work {
             continue;
         }
-        let waited = shutdown
-            .run_until_cancelled(tokio::time::sleep(interval))
-            .await;
-        if waited.is_none() {
+        let wait = async {
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                () = wakeup.notified() => {}
+            }
+        };
+        if shutdown.run_until_cancelled(wait).await.is_none() {
             return;
         }
     }
 }
 
 fn log_store_error(job: &str, error: &StoreError) {
-    tracing::warn!(job, %error, "store error; the job waits one poll interval");
+    tracing::error!(job, error = %chain(error), "store error; the job waits one poll interval");
+}
+
+fn log_read_failure(message_id: i64, failure: &Failure, retry: Retry) {
+    let detail = &failure.detail;
+    match retry {
+        Retry::At { at_ns } => tracing::warn!(
+            job = READER,
+            message_id,
+            permanent = failure.permanent,
+            detail,
+            next_try = %format_instant(Some(at_ns)),
+            "reading failed"
+        ),
+        Retry::Never => tracing::error!(
+            job = READER,
+            message_id,
+            detail,
+            "reading failed; the disclosure will not be tried again"
+        ),
+    }
+}
+
+fn log_download_failure(message_id: i64, attachment_id: i64, failure: &Failure, retry: Retry) {
+    let detail = &failure.detail;
+    match retry {
+        Retry::At { at_ns } => tracing::warn!(
+            job = DOWNLOADER,
+            message_id,
+            attachment_id,
+            permanent = failure.permanent,
+            detail,
+            next_try = %format_instant(Some(at_ns)),
+            "download failed"
+        ),
+        Retry::Never => tracing::error!(
+            job = DOWNLOADER,
+            message_id,
+            attachment_id,
+            detail,
+            "download failed; the attachment will not be tried again"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1000,11 +1292,22 @@ mod tests {
     /// it as the last pass starts. Returns when each pass started, in
     /// seconds of tokio's clock.
     async fn pass_starts(results: Vec<Result<usize, StoreError>>) -> Vec<u64> {
+        pass_starts_with(results, &Notify::new(), || {}).await
+    }
+
+    /// As `pass_starts`, with `wakeup` given to `repeat` and `during_pass`
+    /// called as each pass starts.
+    async fn pass_starts_with(
+        results: Vec<Result<usize, StoreError>>,
+        wakeup: &Notify,
+        during_pass: impl Fn(),
+    ) -> Vec<u64> {
         let shutdown = CancellationToken::new();
         let start = Instant::now();
         let starts = std::sync::Mutex::new(Vec::new());
         let results = std::sync::Mutex::new(std::collections::VecDeque::from(results));
-        repeat("test", INTERVAL, &shutdown, || {
+        repeat("test", INTERVAL, wakeup, &shutdown, || {
+            during_pass();
             starts.lock().unwrap().push(start.elapsed().as_secs());
             let mut results = results.lock().unwrap();
             let result = results.pop_front().unwrap_or(Ok(0));
@@ -1043,17 +1346,145 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn repeat__cancelled_during_a_pass__returns_without_waiting_for_it() {
         let shutdown = CancellationToken::new();
+        let wakeup = Notify::new();
         let pass_that_never_ends = std::future::pending::<Result<usize, StoreError>>;
 
         let stopped = tokio::time::timeout(Duration::from_secs(1), async {
             tokio::join!(
-                repeat("test", INTERVAL, &shutdown, pass_that_never_ends),
+                repeat("test", INTERVAL, &wakeup, &shutdown, pass_that_never_ends),
                 async { shutdown.cancel() },
             )
         })
         .await;
 
         assert!(stopped.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeat__wakeup_during_the_wait__starts_the_next_pass_at_once() {
+        let wakeup = Notify::new();
+        let wake_after_ten_seconds = async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            wakeup.notify_one();
+        };
+
+        let (starts, ()) = tokio::join!(
+            pass_starts_with(vec![Ok(0), Ok(0)], &wakeup, || {}),
+            wake_after_ten_seconds,
+        );
+
+        assert_eq!(starts, [0, 10]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeat__wakeup_during_a_pass__starts_the_next_pass_at_once() {
+        let wakeup = Notify::new();
+
+        let starts = pass_starts_with(vec![Ok(0), Ok(0)], &wakeup, || wakeup.notify_one()).await;
+
+        assert_eq!(starts, [0, 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeat__cancelled_during_the_wait__returns_without_waiting_for_the_interval() {
+        let shutdown = CancellationToken::new();
+        let wakeup = Notify::new();
+        let pass_without_work = || async { Ok(0) };
+        let cancel_after_one_second = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            shutdown.cancel();
+        };
+
+        let stopped = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                repeat("test", INTERVAL, &wakeup, &shutdown, pass_without_work),
+                cancel_after_one_second,
+            )
+        })
+        .await;
+
+        assert!(stopped.is_ok());
+    }
+
+    #[test]
+    fn job_states__nothing_recorded__snapshot_has_no_time_for_any_job() {
+        let states = JobStates::default();
+
+        let snapshot = states.snapshot();
+
+        assert_eq!(snapshot, JobStatesSnapshot::default());
+    }
+
+    #[test]
+    fn job_states__success_of_reader__snapshot_has_its_time() {
+        let states = JobStates::default();
+
+        states.record_success(Job::Reader, now());
+
+        assert_eq!(states.snapshot().reader.last_success_ns, Some(now()));
+    }
+
+    #[test]
+    fn job_states__success_of_reader__leaves_the_other_jobs_unchanged() {
+        let states = JobStates::default();
+
+        states.record_success(Job::Reader, now());
+
+        assert_eq!(states.snapshot().job(Job::Downloader), &JobState::default());
+    }
+
+    #[test]
+    fn job_states__pass_end_of_poller__snapshot_has_its_time() {
+        let states = JobStates::default();
+
+        states.record_pass_end(Job::Poller, now());
+
+        assert_eq!(states.snapshot().poller.last_pass_ended_ns, Some(now()));
+    }
+
+    #[test]
+    fn job_states__failure_of_downloader__snapshot_has_its_time_and_text() {
+        let states = JobStates::default();
+
+        states.record_failure(Job::Downloader, now(), "HTTP 503".to_owned());
+
+        assert_eq!(
+            states.snapshot().downloader.last_failure,
+            Some(JobFailure {
+                at_ns: now(),
+                detail: "HTTP 503".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn job_states__second_failure__replaces_the_first() {
+        let states = JobStates::default();
+        states.record_failure(Job::Backfiller, now(), "HTTP 503".to_owned());
+
+        states.record_failure(Job::Backfiller, now() + HOUR, "timed out".to_owned());
+
+        assert_eq!(
+            states.snapshot().backfiller.last_failure,
+            Some(JobFailure {
+                at_ns: now() + HOUR,
+                detail: "timed out".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn format_instant__an_instant__writes_it_in_rfc_3339_utc() {
+        let text = format_instant(Some(utc_ns("2026-09-23T08:00:00Z")));
+
+        assert_eq!(text, "2026-09-23T08:00:00Z");
+    }
+
+    #[test]
+    fn format_instant__none__returns_never() {
+        let text = format_instant(None);
+
+        assert_eq!(text, "never");
     }
 
     #[test]
