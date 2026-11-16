@@ -1,4 +1,5 @@
-//! The messages and gRPC stubs of the contract, `com.vizroy.xosl.newsweb.v1`.
+//! The messages and gRPC stubs of the contract, `com.vizroy.xosl.newsweb.v1`,
+//! and the exchange's JSON responses in `raw`.
 //!
 //! `src/gen` is written by `just gen` from the `.proto` files under
 //! `contracts/` and committed. Never edit it: change the `.proto`, then
@@ -8,6 +9,11 @@
 #![allow(dead_code, clippy::all)]
 
 include!("gen/com/vizroy/xosl/newsweb/v1/com.vizroy.xosl.newsweb.v1.rs");
+
+/// The NewsWeb API's JSON responses, `com.vizroy.xosl.newsweb.raw.v1`.
+pub mod raw {
+    include!("gen/com/vizroy/xosl/newsweb/raw/v1/com.vizroy.xosl.newsweb.raw.v1.rs");
+}
 
 #[cfg(test)]
 mod tests {

@@ -59,10 +59,12 @@ jobs:
             https://github.com/bufbuild/buf/releases/download/v1.69.0/buf-Linux-x86_64.tar.gz buf.tgz
           fetch 038a43ee2df38504bc28b9adc078733622be367af9f58dd874c7e4e02b2b8756 \
             $quick/protoc-gen-prost-0.5.0/protoc-gen-prost-0.5.0-x86_64-unknown-linux-musl.tar.gz protoc-gen-prost.tgz
+          fetch 0eb4ce2f823371abfc82631b7e11ff8c93ca196453b9ec55256b51d2826decae \
+            $quick/protoc-gen-prost-serde-0.4.0/protoc-gen-prost-serde-0.4.0-x86_64-unknown-linux-musl.tar.gz protoc-gen-prost-serde.tgz
           fetch 44dbd20acdb50454380918ab6de336dd1fc55e4f5e6788b8a886e598811fba4d \
             $quick/protoc-gen-tonic-0.5.0/protoc-gen-tonic-0.5.0-x86_64-unknown-linux-musl.tar.gz protoc-gen-tonic.tgz
           tar -xzf "$RUNNER_TEMP/buf.tgz" -C ~/.local --strip-components=1 --no-same-owner buf/bin
-          for p in protoc-gen-prost protoc-gen-tonic; do
+          for p in protoc-gen-prost protoc-gen-prost-serde protoc-gen-tonic; do
             tar -xzf "$RUNNER_TEMP/$p.tgz" -C ~/.local/bin --no-same-owner $p
           done
           buf --version

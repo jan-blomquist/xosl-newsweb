@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+// The NewsWeb API's JSON responses, as the exchange sends them. Not part of
+// what the mirror serves: these messages exist to decode the exchange's JSON,
+// and they change when the exchange changes its API.
+//
+// Field names are the exchange's, in snake_case; proto-JSON reads its
+// camelCase keys into them. A field the exchange does not send decodes to its
+// default.
+package com.vizroy.xosl.newsweb.raw.v1;
+
+// Every response is an envelope of `header` and `data`.
+message Header {
+  // The status that counts. A failure can arrive under HTTP 200.
+  optional int32 http_code = 1 [json_name = "http.code"];
+  string result_text = 2 [json_name = "result.text"];
+}
+
+// The response of `list`: the disclosures of whole Oslo calendar days.
+message ListResponse {
+  Header header = 1;
+  ListData data = 2;
+}
+
+message ListData {
+  repeated Message messages = 1;
+  // The exchange truncated the result.
+  bool overflow = 2;
+}
+
+// The response of `message`: one disclosure in full.
+message MessageResponse {
+  Header header = 1;
+  MessageData data = 2;
+}
+
+message MessageData {
+  Message message = 1;
+}
+
+// One disclosure. `list` returns a projection: `body` and `attachments` are
+// absent, and `instr_id`, the instrument names, `oam_mandatory` and
+// `info_required` read as zero or empty whatever their real values.
+message Message {
+  int64 message_id = 1;
+  int64 news_id = 2;
+  string client_announcement_id = 3;
+  int64 issuer_id = 4;
+  string issuer_name = 5;
+  string issuer_sign = 6;
+  int64 instr_id = 7;
+  string instrument_name = 8;
+  string instrument_full_name = 9;
+  repeated string markets = 10;
+  // ISO 8601, UTC: "2026-08-29T12:02:56.354Z".
+  string published_time = 11;
+  string title = 12;
+  string body = 13;
+  repeated Category category = 14;
+  repeated Attachment attachments = 15;
+  // The exchange's spelling.
+  int32 numb_attachments = 16;
+  int32 oam_mandatory = 17;
+  int32 info_required = 18;
+  bool test = 19;
+  int64 correction_for_message_id = 20;
+  int64 corrected_by_message_id = 21;
+}
+
+message Category {
+  int32 id = 1;
+  // The exchange sends these two keys in snake_case.
+  string category_no = 2;
+  string category_en = 3;
+}
+
+message Attachment {
+  int64 id = 1;
+  string name = 2;
+}
