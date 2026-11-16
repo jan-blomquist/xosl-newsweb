@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package com.vizroy.xosl.newsweb.v1;
+
+// One disclosure as the mirror holds it.
+//
+// Every id is the exchange's; the mirror generates none. Times are UTC
+// nanoseconds since the Unix epoch; 0 means unset.
+message Disclosure {
+  // The exchange's id of the disclosure: the number in its NewsWeb address.
+  int64 message_id = 1;
+  // The exchange's `newsId`.
+  int64 news_id = 2;
+  // The exchange's `clientAnnouncementId`: a UUID, unique per disclosure.
+  string client_announcement_id = 3;
+  Issuer issuer = 4;
+  // Unset when the exchange names no instrument, which is common, and until
+  // the disclosure has been read in full.
+  Instrument instrument = 5;
+  // Market codes as the exchange gives them: "XOSL", "XOAX", "MERK", ...
+  // Usually one to three; a few disclosures carry none.
+  repeated string markets = 6;
+  // The exchange's publication time.
+  int64 published_at_ns = 7;
+  // When the mirror first saw the disclosure. Close to the publication time
+  // for one caught live; much later for one fetched from history.
+  int64 received_at_ns = 8;
+  string title = 9;
+  // Empty until the disclosure has been read in full.
+  string body = 10;
+  // False while only the exchange's list entry is known: title, issuer and
+  // time are set, body and attachments are not yet.
+  bool read_in_full = 11;
+  // The exchange's category ids, as plain numbers. The exchange sends a
+  // list; in practice it holds exactly one. An id the exchange adds later
+  // arrives here unchanged.
+  repeated int32 category_ids = 12;
+  repeated Attachment attachments = 13;
+  // Regulatory flags, as the exchange states them. False until the
+  // disclosure has been read in full.
+  bool oam_mandatory = 14;
+  bool info_required = 15;
+  // A test publication. Lists leave these out; a get by id returns them.
+  bool test = 16;
+  // The disclosure this one corrects, as the exchange states it; 0 when
+  // none.
+  int64 correction_for_message_id = 17;
+  // The disclosure that corrects this one; 0 when none is stored. Set by
+  // the mirror once it holds a disclosure whose `correction_for_message_id`
+  // names this one.
+  int64 corrected_by_message_id = 18;
+}
+
+message Issuer {
+  int64 id = 1;
+  // The ticker. One sign can name several issuers.
+  string sign = 2;
+  // The issuer's current name, also on its older disclosures.
+  string name = 3;
+}
+
+message Instrument {
+  int64 id = 1;
+  string name = 2;
+  string full_name = 3;
+}
+
+message Attachment {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    // Named by the disclosure; its bytes are not yet in the mirror.
+    STATE_PENDING = 1;
+    STATE_STORED = 2;
+    // Not retried: it failed permanently the maximum number of times.
+    STATE_FAILED = 3;
+  }
+
+  // The exchange's id of the attachment. Address it together with its
+  // disclosure's `message_id`, as the exchange does.
+  int64 id = 1;
+  // The file name the issuer gave it.
+  string name = 2;
+  State state = 3;
+  // Detected from the bytes, not taken from the name. Set once stored.
+  string content_type = 4;
+  int64 size_bytes = 5;
+  // Lowercase hex. Set once stored.
+  string sha256 = 6;
+}

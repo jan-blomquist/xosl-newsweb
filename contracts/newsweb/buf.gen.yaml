@@ -1,0 +1,11 @@
+# Run from contracts/ by `just gen`. The Rust code is written to src/gen and
+# committed: building needs no buf.
+version: v2
+clean: true
+plugins:
+  - local: protoc-gen-prost
+    out: ../src/gen
+    opt:
+      - bytes=.
+  - local: protoc-gen-tonic
+    out: ../src/gen

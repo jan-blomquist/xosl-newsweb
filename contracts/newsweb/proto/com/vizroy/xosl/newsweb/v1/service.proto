@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package com.vizroy.xosl.newsweb.v1;
+
+import "com/vizroy/xosl/newsweb/v1/event.proto";
+import "com/vizroy/xosl/newsweb/v1/model.proto";
+
+// Everything the mirror serves.
+service NewswebService {
+  // Streams every disclosure the filter matches, newest first: by
+  // publication time, then by message id, both descending. There is no row limit;
+  // narrow with the filter or cancel the call. Test disclosures are left
+  // out. Corrected disclosures are included, marked by `corrected_by_message_id`.
+  rpc ListDisclosures(ListDisclosuresRequest) returns (stream ListDisclosuresResponse);
+
+  // One disclosure by the exchange's message id. NOT_FOUND when the mirror
+  // does not hold it.
+  rpc GetDisclosure(GetDisclosureRequest) returns (GetDisclosureResponse);
+
+  // Streams a stored attachment's bytes in order. Its name, type, size and
+  // hash come from the disclosure. NOT_FOUND when the disclosure has no such
+  // attachment, FAILED_PRECONDITION while it is pending or failed.
+  rpc ReadAttachment(ReadAttachmentRequest) returns (stream ReadAttachmentResponse);
+
+  // Streams the events after `since_seq` in order, then stays open and
+  // sends each new event as it is written. OUT_OF_RANGE when `since_seq` is
+  // greater than the latest event's `seq`.
+  rpc WatchEvents(WatchEventsRequest) returns (stream WatchEventsResponse);
+}
+
+message DisclosureFilter {
+  // Published at or after this time; 0 is unbounded.
+  int64 published_from_ns = 1;
+  // Published before this time; 0 is unbounded.
+  int64 published_before_ns = 2;
+  // Tickers. A disclosure matches when its issuer's sign is any of them;
+  // empty matches every issuer.
+  repeated string issuer_signs = 3;
+}
+
+message ListDisclosuresRequest {
+  DisclosureFilter filter = 1;
+}
+
+message ListDisclosuresResponse {
+  Disclosure disclosure = 1;
+}
+
+message GetDisclosureRequest {
+  int64 message_id = 1;
+}
+
+message GetDisclosureResponse {
+  Disclosure disclosure = 1;
+}
+
+message ReadAttachmentRequest {
+  // The disclosure the attachment belongs to.
+  int64 message_id = 1;
+  int64 attachment_id = 2;
+}
+
+message ReadAttachmentResponse {
+  // The next bytes; the chunks joined are the file.
+  bytes chunk = 1;
+}
+
+message WatchEventsRequest {
+  // The `seq` of the last event the consumer handled; 0 replays the whole
+  // log.
+  int64 since_seq = 1;
+}
+
+message WatchEventsResponse {
+  Event event = 1;
+}

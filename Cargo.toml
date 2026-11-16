@@ -1,12 +1,16 @@
-[workspace]
-members = ["crates/*"]
-resolver = "3"
-
-[workspace.package]
+[package]
+name = "xosl-newsweb"
+description = "Self-hosted mirror of Oslo Børs NewsWeb: company disclosures and their attachments, served over gRPC. Unofficial."
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/jan-blomquist/xosl-newsweb"
 authors = ["Jan Blomquist"]
+readme = "README.md"
 # A service, released as a container image; nothing goes to crates.io.
 publish = false
+
+[dependencies]
+prost = "0.14"
+tonic = "0.14"
+tonic-prost = "0.14"
