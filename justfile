@@ -29,7 +29,7 @@ gen:
 test:
     cargo test --lib --bins
 
-# The integration tests under tests/, except the live ones: they run SQLite.
+# The integration tests under tests/, except the live ones: SQLite and object stores.
 test-integration:
     cargo test --test '*'
 
@@ -40,3 +40,9 @@ test-live:
 # The release binary, in target/release/.
 build:
     cargo build --release
+
+# Lists today and yesterday, reads every disclosure in full and downloads its
+# attachments: roughly 100 to 200 requests, one per second. Never run by the gate.
+# For manual use: the mirror against the real exchange, into ./data.
+dev:
+    cargo run -- run --ingest --lookback-days 1 --data-dir data

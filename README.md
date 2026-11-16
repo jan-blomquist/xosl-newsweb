@@ -1,8 +1,7 @@
 # xosl-newsweb
 
 A self-hosted mirror of [Oslo Børs NewsWeb](https://newsweb.oslobors.no/):
-company disclosures and their attachments, kept on your own disk and served
-over gRPC.
+company disclosures and their attachments, kept on your own disk.
 
 Unofficial. Not affiliated with, or endorsed by, Euronext or Oslo Børs.
 
@@ -14,9 +13,9 @@ general meetings. It is a website made for reading one disclosure at a time.
 
 Analysis needs something else: every disclosure of one company, everything
 published last night, the PDFs themselves, and a way to hear about a new
-disclosure the moment it appears. `xosl-newsweb` keeps your own copy and
-answers those questions from it, so your programs talk to your mirror and not
-to the exchange.
+disclosure the moment it appears. `xosl-newsweb` keeps your own copy, and its
+gRPC interface will answer those questions from it, so your programs talk to
+your mirror and not to the exchange.
 
 ## What it will do
 
@@ -33,12 +32,50 @@ nothing else to install:
   resume where it left off.
 - **Report** on itself: what it holds, how far behind it is, what failed.
 
-The same binary carries a command-line client for those calls, for people and
-for scripts.
+The same binary will carry a command-line client for those calls, for people
+and for scripts.
 
-gRPC is the only interface. The database schema and the file layout are
+gRPC will be the only interface. The database schema and the file layout are
 internal and can change between versions, so no other program should read
 them directly.
+
+Polling, backfill and download exist; the gRPC server, the command-line client
+and the report do not exist yet.
+
+## Running
+
+```
+xosl-newsweb run --ingest
+```
+
+`run` opens the data folder and, with `--ingest`, lists today once a poll
+interval, lists the past days of the lookback range until each is known
+complete, reads every listed disclosure in full and downloads its attachments.
+It runs until SIGINT or SIGTERM. Without `--ingest` it opens the data folder,
+logs which past days are complete, and sends the exchange no request.
+
+Each setting is a flag and an environment variable; `xosl-newsweb run --help`
+lists them.
+
+| Flag | Variable | Default | Meaning |
+|---|---|---|---|
+| `--data-dir <DIR>` | `XOSL_NEWSWEB_DATA_DIR` | `./data` | The data folder; created when missing. |
+| `--ingest` | `XOSL_NEWSWEB_INGEST` | off | Copy NewsWeb into the data folder. The variable takes `true` or `false`. |
+| `--request-interval-ms <N>` | `XOSL_NEWSWEB_REQUEST_INTERVAL_MS` | `1000` | The shortest time between two requests to the exchange; at least 1000. |
+| `--poll-interval-secs <N>` | `XOSL_NEWSWEB_POLL_INTERVAL_SECS` | `60` | How often today is listed; at least 1. |
+| `--lookback-days <N>` | `XOSL_NEWSWEB_LOOKBACK_DAYS` | `7` | How many past days are kept complete; at least 1. |
+
+Days are Oslo calendar days. A past day is complete once a listing of it,
+made at least two hours after the day ended, was not truncated and decoded in
+full. A day the exchange truncates is listed again once a day.
+
+The data folder holds:
+
+- `mirror.sqlite`: the database. While `run` runs, SQLite keeps
+  `mirror.sqlite-wal` and `mirror.sqlite-shm` beside it.
+- `attachments/<message id>/<attachment id>`: the bytes of each attachment.
+
+Log lines go to stderr. `RUST_LOG` sets the level; the default is `info`.
 
 Out of scope: search, text extraction, classification and anything else
 derived from the disclosures. Those belong in the programs that consume the
@@ -95,6 +132,7 @@ defaults keep the load low:
    just test               # the unit tests only
    just test-integration   # the integration tests only
    just test-live          # the tests that call the real exchange
+   just dev                # the mirror against the real exchange, into ./data
    just gen                # regenerate the Rust code after changing a .proto file
    just build              # the release binary, in target/release/
    ```
@@ -109,8 +147,14 @@ The tests are in two places, by what they touch:
 - **Unit tests** are inline in `src/`, beside the code. They run in memory:
   no file, no database, no network, no real clock.
 - **Integration tests** are under `tests/`. `tests/store.rs` runs the schema
-  and the queries against SQLite. `tests/live.rs` calls the real exchange and
-  is ignored unless run with `just test-live`; the gate never runs it.
+  and the queries against SQLite; `tests/files.rs` stores attachments in an
+  object store in memory and in a temporary folder; `tests/ingest.rs` runs the
+  ingest jobs against a fake exchange, with the database and the attachments
+  in memory. `tests/live.rs` calls the real exchange and is ignored unless run
+  with `just test-live`; the gate never runs it.
+
+`just dev` contacts the real exchange too: roughly 100 to 200 requests, one
+per second. It is for manual use, and the gate never runs it.
 
 Changes arrive as pull requests, squash-merged once the `gate` workflow is
 green. The gate runs `just check`: format, clippy, buf lint, the unit tests

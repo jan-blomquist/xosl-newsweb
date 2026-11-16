@@ -40,6 +40,8 @@ pub struct Page {
     /// The exchange truncated the result: the day holds more disclosures than
     /// `entries` does.
     pub overflow: bool,
+    /// Rows of the response that did not decode and are not in `entries`.
+    pub undecodable: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +52,8 @@ pub enum DecodeError {
     NotEnvelope(#[source] serde_json::Error),
     #[error("the exchange answered 200 without data")]
     NoData,
+    #[error("a row of the list is not a disclosure")]
+    NotDisclosure(#[source] serde_json::Error),
     #[error("the exchange sent a disclosure without a message id")]
     NoMessageId,
     #[error("urls.json names {value:?} as the API base, which is not an https URL")]
@@ -117,26 +121,48 @@ pub fn oslo_day(at_ns: i64) -> Date {
 }
 
 /// Decodes a `list` response. The disclosures are not read in full.
+///
+/// A row that does not decode is left out of `entries`, logged and counted in
+/// `undecodable`; the other rows are returned. Only a failure of the envelope
+/// fails the call.
 pub fn decode_list(body: &[u8]) -> Result<Page, DecodeError> {
-    let envelope: serde_json::Value = decode_json(body)?;
-    let documents = documents_at(&envelope, "/data/messages");
+    let mut envelope: serde_json::Value = decode_json(body)?;
+    // The rows are taken out before the envelope is decoded, so that a row
+    // with a key of the wrong type fails that row only.
+    let rows = envelope
+        .pointer_mut("/data/messages")
+        .and_then(serde_json::Value::as_array_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
     let response: raw::ListResponse =
         serde_json::from_value(envelope).map_err(DecodeError::NotEnvelope)?;
     let data = successful(response.header, response.data)?;
-    let entries = data
-        .messages
-        .iter()
-        .zip(documents)
-        .map(|(message, document)| {
-            Ok(Fetched {
-                disclosure: list_entry(message)?,
-                document,
-            })
-        })
-        .collect::<Result<_, DecodeError>>()?;
+
+    let mut entries = Vec::with_capacity(rows.len());
+    let mut undecodable = 0;
+    for row in rows {
+        match list_row(row) {
+            Ok(entry) => entries.push(entry),
+            Err(error) => {
+                tracing::warn!(%error, "a row of the list does not decode");
+                undecodable += 1;
+            }
+        }
+    }
     Ok(Page {
         entries,
         overflow: data.overflow,
+        undecodable,
+    })
+}
+
+/// One row of a `list` response, the JSON text of the row kept as its document.
+fn list_row(row: serde_json::Value) -> Result<Fetched, DecodeError> {
+    let document = row.to_string();
+    let message: raw::Message = serde_json::from_value(row).map_err(DecodeError::NotDisclosure)?;
+    Ok(Fetched {
+        disclosure: list_entry(&message)?,
+        document,
     })
 }
 
@@ -165,15 +191,6 @@ pub fn decode_document(document: &str, read_in_full: bool) -> Result<Disclosure,
     } else {
         list_entry(&message)
     }
-}
-
-/// The JSON text of each element of the array at `pointer`.
-fn documents_at(envelope: &serde_json::Value, pointer: &str) -> Vec<String> {
-    envelope
-        .pointer(pointer)
-        .and_then(serde_json::Value::as_array)
-        .map(|messages| messages.iter().map(serde_json::Value::to_string).collect())
-        .unwrap_or_default()
 }
 
 /// Removes what a stored text must not hold: NUL and the other C0 control
@@ -304,7 +321,21 @@ mod tests {
         "test": false, "correctionForMessageId": 699990, "correctedByMessageId": 0
     }"#;
 
+    const ROW_WITHOUT_MESSAGE_ID: &str =
+        r#"{"publishedTime": "2026-01-01T00:00:00Z", "title": "t"}"#;
+    const ROW_WITH_TEXT_MESSAGE_ID: &str =
+        r#"{"messageId": "seven", "publishedTime": "2026-01-01T00:00:00Z", "title": "t"}"#;
+    const ROW_WITH_MALFORMED_TIME: &str =
+        r#"{"messageId": 7, "publishedTime": "yesterday", "title": "t"}"#;
+
     const PUBLISHED_AT_NS: i64 = 1_790_115_365_250_000_000;
+
+    /// `LIST_ROW` as `decode_list` keeps it: compact JSON.
+    fn list_row_document() -> String {
+        serde_json::from_str::<serde_json::Value>(LIST_ROW)
+            .unwrap()
+            .to_string()
+    }
 
     fn list_response(rows: &str, overflow: bool) -> Vec<u8> {
         format!(
@@ -425,12 +456,62 @@ mod tests {
     }
 
     #[test]
-    fn decode_list__row_without_message_id__returns_error() {
-        let row = r#"{"publishedTime": "2026-01-01T00:00:00Z", "title": "t"}"#;
+    fn decode_list__every_row_decodes__counts_none_undecodable() {
+        let page = decode_list(&list_response(LIST_ROW, false)).unwrap();
 
-        let error = decode_list(&list_response(row, false)).unwrap_err();
+        assert_eq!(page.undecodable, 0);
+    }
 
-        assert!(matches!(error, DecodeError::NoMessageId));
+    #[test]
+    fn decode_list__row_without_message_id__returns_the_other_rows() {
+        let rows = format!("{LIST_ROW}, {ROW_WITHOUT_MESSAGE_ID}");
+
+        let page = decode_list(&list_response(&rows, false)).unwrap();
+
+        let ids: Vec<i64> = page
+            .entries
+            .iter()
+            .map(|e| e.disclosure.message_id)
+            .collect();
+        assert_eq!(ids, [700001]);
+    }
+
+    #[test]
+    fn decode_list__undecodable_rows__counts_each() {
+        let rows = format!(
+            "{ROW_WITHOUT_MESSAGE_ID}, {LIST_ROW}, {ROW_WITH_MALFORMED_TIME}, {ROW_WITH_TEXT_MESSAGE_ID}, 17"
+        );
+
+        let page = decode_list(&list_response(&rows, false)).unwrap();
+
+        assert_eq!(page.undecodable, 4);
+    }
+
+    #[test]
+    fn decode_list__row_with_message_id_of_wrong_type__returns_the_other_rows() {
+        let rows = format!("{ROW_WITH_TEXT_MESSAGE_ID}, {LIST_ROW}");
+
+        let page = decode_list(&list_response(&rows, false)).unwrap();
+
+        assert_eq!(page.entries[0].document, list_row_document());
+    }
+
+    #[test]
+    fn decode_list__messages_not_an_array__returns_envelope_error() {
+        let body = br#"{"header": {"http.code": 200}, "data": {"messages": 5}}"#;
+
+        let error = decode_list(body).unwrap_err();
+
+        assert!(matches!(error, DecodeError::NotEnvelope(_)));
+    }
+
+    #[test]
+    fn decode_list__code_200_without_data__returns_no_data() {
+        let body = br#"{"header": {"http.code": 200}}"#;
+
+        let error = decode_list(body).unwrap_err();
+
+        assert!(matches!(error, DecodeError::NoData));
     }
 
     #[test]
@@ -461,10 +542,8 @@ mod tests {
     }
 
     #[test]
-    fn decode_list__publication_time_malformed__names_message_and_value() {
-        let row = r#"{"messageId": 7, "publishedTime": "yesterday", "title": "t"}"#;
-
-        let error = decode_list(&list_response(row, false)).unwrap_err();
+    fn decode_document__publication_time_malformed__names_message_and_value() {
+        let error = decode_document(ROW_WITH_MALFORMED_TIME, false).unwrap_err();
 
         assert_eq!(
             error.to_string(),

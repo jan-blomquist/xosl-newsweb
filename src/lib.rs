@@ -4,6 +4,10 @@
 //! split exists so the integration tests under `tests/` can call the public
 //! API.
 
+pub mod cli;
+pub mod clock;
 pub mod exchange;
+pub mod files;
+pub mod ingest;
 pub mod pb;
 pub mod store;

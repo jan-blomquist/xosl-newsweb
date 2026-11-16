@@ -10,7 +10,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
+use jiff::civil::Date;
 use prost::Message;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{SqliteConnection, SqlitePool};
@@ -38,6 +40,116 @@ pub enum StoreError {
     },
     #[error("message {message_id} has no attachment {attachment_id}")]
     NoAttachment { message_id: i64, attachment_id: i64 },
+    #[error("no disclosure {message_id} is stored")]
+    NoDisclosure { message_id: i64 },
+    #[error("failure {id}: stage {stage} is not a stage")]
+    FailureStage { id: i64, stage: i64 },
+    #[error("the stored day {value:?} is not a date")]
+    Day {
+        value: String,
+        #[source]
+        source: jiff::Error,
+    },
+}
+
+/// Permanent failures after which a disclosure or an attachment is not
+/// requested again.
+pub const MAX_PERMANENT_FAILURES: u32 = 3;
+
+/// How long a caller of an in-memory store waits for its one connection.
+const IN_MEMORY_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(365 * 86_400);
+
+const MINUTE_NS: i64 = 60_000_000_000;
+const DAY_NS: i64 = 24 * 60 * MINUTE_NS;
+
+/// The delay before the next try after `consecutive_failures` failures in a
+/// row: 1 minute after the first, doubling with each further failure, at most
+/// 24 hours. 0 when nothing has failed.
+pub fn retry_delay_ns(consecutive_failures: u32) -> i64 {
+    if consecutive_failures == 0 {
+        return 0;
+    }
+    // 2^11 minutes exceed 24 hours, so a larger exponent changes nothing.
+    let doublings = (consecutive_failures - 1).min(11);
+    (MINUTE_NS << doublings).min(DAY_NS)
+}
+
+/// A failed attempt to read a disclosure in full or to download an
+/// attachment, as the job that made it reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Failure {
+    /// A retry cannot change the result, such as a 404 from the exchange.
+    pub permanent: bool,
+    pub detail: String,
+}
+
+/// What a failed attempt was for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureStage {
+    /// Listing one day.
+    List,
+    /// Reading one disclosure in full.
+    Read,
+    /// Downloading one attachment.
+    Attachment,
+}
+
+impl FailureStage {
+    /// The value of the `stage` column.
+    fn code(self) -> i64 {
+        match self {
+            Self::List => 1,
+            Self::Read => 2,
+            Self::Attachment => 3,
+        }
+    }
+
+    fn from_code(code: i64) -> Option<Self> {
+        match code {
+            1 => Some(Self::List),
+            2 => Some(Self::Read),
+            3 => Some(Self::Attachment),
+            _ => None,
+        }
+    }
+}
+
+/// A row of the failure log.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FailureRecord {
+    pub id: i64,
+    pub at_ns: i64,
+    pub stage: FailureStage,
+    pub permanent: bool,
+    /// 0 for a failure to list a day.
+    pub message_id: i64,
+    /// 0 unless `stage` is `Attachment`.
+    pub attachment_id: i64,
+    /// The Oslo calendar day listed, when `stage` is `List`.
+    pub day: Option<Date>,
+    pub detail: String,
+}
+
+/// An attachment to download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachmentRef {
+    pub message_id: i64,
+    pub attachment_id: i64,
+}
+
+/// The result of listing one Oslo calendar day.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListedDay {
+    pub day: Date,
+    pub listed_at_ns: i64,
+    /// Rows on the list, `undecodable` included.
+    pub rows: u32,
+    /// The exchange truncated the list.
+    pub overflow: bool,
+    /// Rows on the list that did not decode.
+    pub undecodable: u32,
+    /// The day is known to be complete.
+    pub sealed: bool,
 }
 
 /// Where a list of disclosures continues: after the disclosure with this
@@ -82,13 +194,25 @@ impl Store {
     }
 
     /// A database that lives as long as the store. One connection, since
-    /// every connection to `:memory:` opens a database of its own.
+    /// every connection to `:memory:` opens a database of its own, and the
+    /// pool never closes it for being idle or old, since closing it discards
+    /// the database.
+    ///
+    /// There is no server to lose, so the pool does not test the connection
+    /// before use, and a caller waits for it as long as the other callers
+    /// hold it, up to `IN_MEMORY_ACQUIRE_TIMEOUT`. On tokio's paused clock,
+    /// which advances while the runtime waits for SQLite's thread, the
+    /// default of 30 seconds can pass during one wait.
     pub async fn open_in_memory() -> Result<Self, StoreError> {
         let options = SqliteConnectOptions::new()
             .in_memory(true)
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .test_before_acquire(false)
+            .acquire_timeout(IN_MEMORY_ACQUIRE_TIMEOUT)
             .connect_with(options)
             .await?;
         Self::migrated(pool).await
@@ -99,22 +223,46 @@ impl Store {
         Ok(Self { pool })
     }
 
-    /// Stores a row of the exchange's list. A disclosure already stored is
-    /// left as it is: a list row holds nothing the store does not have.
-    pub async fn store_list_entry(&self, entry: &Fetched, now_ns: i64) -> Result<(), StoreError> {
+    /// Stores a row of the exchange's list. For a disclosure already stored,
+    /// the listed fields are compared with the stored document's: when they
+    /// differ, a list row is replaced with the new one, and a disclosure read
+    /// in full is marked to be read in full again. Neither writes an event for
+    /// the disclosure; the full read writes `REVISED` when the document
+    /// changed. A new row that corrects a disclosure read in full writes
+    /// `CORRECTED` for that one. Returns
+    /// whether the disclosure was new to the store.
+    pub async fn store_list_entry(&self, entry: &Fetched, now_ns: i64) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await?;
         let inserted = insert_disclosure(&mut tx, entry, false, now_ns).await?;
         if inserted {
             write_corrected_event_for_original(&mut tx, &entry.disclosure, now_ns).await?;
+        } else {
+            let stored: StoredDocument = sqlx::query_as(
+                "SELECT read_in_full, document FROM disclosures WHERE message_id = ?",
+            )
+            .bind(entry.disclosure.message_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            match listed_change(&stored, &entry.disclosure) {
+                ListedChange::Unchanged => {}
+                ListedChange::NewListRow => replace_list_row(&mut tx, entry).await?,
+                ListedChange::Reread => {
+                    sqlx::query("UPDATE disclosures SET reread = 1 WHERE message_id = ?")
+                        .bind(entry.disclosure.message_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
         }
         tx.commit().await?;
-        Ok(())
+        Ok(inserted)
     }
 
     /// Stores a disclosure read in full, and writes the event for what
     /// changed: `DISCOVERED` on the first full read, `REVISED` when the
     /// exchange's document differs from the stored one, nothing when it is
-    /// the same.
+    /// the same. In every case the disclosure leaves the queue of
+    /// `unread_disclosures`, and its earlier failures no longer count.
     pub async fn store_message(&self, message: &Fetched, now_ns: i64) -> Result<(), StoreError> {
         let message_id = message.disclosure.message_id;
         let mut tx = self.pool.begin().await?;
@@ -126,28 +274,260 @@ impl Store {
                 .await?;
         let is_new = stored.is_none();
         let change = full_read(stored.as_ref(), &message.document);
-        if change == FullRead::Unchanged {
-            return Ok(());
-        }
 
         if is_new {
             insert_disclosure(&mut tx, message, true, now_ns).await?;
-        } else {
+        } else if change != FullRead::Unchanged {
             update_disclosure(&mut tx, message).await?;
         }
-        insert_attachments(&mut tx, &message.disclosure).await?;
-        if change == FullRead::Revised {
-            write_event(&mut tx, event::Kind::Revised, message_id, 0, now_ns).await?;
-        } else {
-            write_event(&mut tx, event::Kind::Discovered, message_id, 0, now_ns).await?;
-            if is_new {
-                write_corrected_event_for_original(&mut tx, &message.disclosure, now_ns).await?;
+        sqlx::query(
+            "UPDATE disclosures
+                SET reread = 0, attempts = 0, transient_failures = 0, retry_after_ns = 0,
+                    last_error = ''
+              WHERE message_id = ?",
+        )
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?;
+
+        match change {
+            FullRead::Unchanged => {}
+            FullRead::Revised => {
+                insert_attachments(&mut tx, &message.disclosure).await?;
+                write_event(&mut tx, event::Kind::Revised, message_id, 0, now_ns).await?;
             }
-            write_corrected_event_if_corrected(&mut tx, message_id, now_ns).await?;
+            FullRead::First => {
+                insert_attachments(&mut tx, &message.disclosure).await?;
+                write_event(&mut tx, event::Kind::Discovered, message_id, 0, now_ns).await?;
+                if is_new {
+                    write_corrected_event_for_original(&mut tx, &message.disclosure, now_ns)
+                        .await?;
+                }
+                write_corrected_event_if_corrected(&mut tx, message_id, now_ns).await?;
+            }
         }
 
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Up to `limit` disclosures to read in full, newest first: those never
+    /// read in full and those marked to be read again, without the failed
+    /// ones and those whose next try is after `now_ns`.
+    pub async fn unread_disclosures(
+        &self,
+        now_ns: i64,
+        limit: u32,
+    ) -> Result<Vec<i64>, StoreError> {
+        // The first two conditions repeat the WHERE clause of the index
+        // `disclosures_unread`.
+        let ids = sqlx::query_scalar(
+            "SELECT message_id FROM disclosures
+              WHERE (read_in_full = 0 OR reread = 1) AND failed = 0
+                AND retry_after_ns <= ?
+              ORDER BY published_at_ns DESC, message_id DESC
+              LIMIT ?",
+        )
+        .bind(now_ns)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids)
+    }
+
+    /// Up to `limit` attachments to download: pending ones whose next try is
+    /// not after `now_ns`, newest disclosure first.
+    pub async fn pending_attachments(
+        &self,
+        now_ns: i64,
+        limit: u32,
+    ) -> Result<Vec<AttachmentRef>, StoreError> {
+        // `state = 1` is PENDING, written as a literal to match the WHERE
+        // clause of the index `attachments_pending`.
+        let rows: Vec<AttachmentRefRow> = sqlx::query_as(
+            "SELECT a.message_id, a.attachment_id
+               FROM attachments a JOIN disclosures d ON d.message_id = a.message_id
+              WHERE a.state = 1 AND a.retry_after_ns <= ?
+              ORDER BY d.published_at_ns DESC, d.message_id DESC, a.attachment_id
+              LIMIT ?",
+        )
+        .bind(now_ns)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| AttachmentRef {
+                message_id: row.message_id,
+                attachment_id: row.attachment_id,
+            })
+            .collect())
+    }
+
+    /// Logs a failed full read and delays the next one. The
+    /// `MAX_PERMANENT_FAILURES`th permanent failure marks the disclosure
+    /// failed; transient failures never do.
+    pub async fn record_read_failure(
+        &self,
+        message_id: i64,
+        failure: &Failure,
+        now_ns: i64,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let counts: Option<RetryCounts> = sqlx::query_as(
+            "SELECT attempts, transient_failures FROM disclosures WHERE message_id = ?",
+        )
+        .bind(message_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let counts = counts.ok_or(StoreError::NoDisclosure { message_id })?;
+        let next = after_failure(counts, failure.permanent, now_ns);
+        sqlx::query(
+            "UPDATE disclosures
+                SET attempts = ?, transient_failures = ?, retry_after_ns = ?,
+                    failed = failed OR ?, last_error = ?, last_attempt_at_ns = ?
+              WHERE message_id = ?",
+        )
+        .bind(next.counts.attempts)
+        .bind(next.counts.transient_failures)
+        .bind(next.retry_after_ns)
+        .bind(next.exhausted)
+        .bind(&failure.detail)
+        .bind(now_ns)
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?;
+        let entry = FailureEntry {
+            stage: FailureStage::Read,
+            permanent: failure.permanent,
+            message_id,
+            attachment_id: 0,
+            day: String::new(),
+            detail: &failure.detail,
+        };
+        insert_failure(&mut tx, &entry, now_ns).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Logs a failed download and delays the next one. The
+    /// `MAX_PERMANENT_FAILURES`th permanent failure sets the attachment's
+    /// state to FAILED and writes `ATTACHMENT_FAILED`, as
+    /// `mark_attachment_failed` does; transient failures never do.
+    pub async fn record_attachment_failure(
+        &self,
+        message_id: i64,
+        attachment_id: i64,
+        failure: &Failure,
+        now_ns: i64,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let counts: Option<AttachmentRetryCounts> = sqlx::query_as(
+            "SELECT state, attempts, transient_failures FROM attachments
+              WHERE message_id = ? AND attachment_id = ?",
+        )
+        .bind(message_id)
+        .bind(attachment_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let counts = counts.ok_or(StoreError::NoAttachment {
+            message_id,
+            attachment_id,
+        })?;
+        let already_failed = counts.state == attachment::State::Failed as i32;
+        let next = after_failure(counts.counts, failure.permanent, now_ns);
+        sqlx::query(
+            "UPDATE attachments
+                SET attempts = ?, transient_failures = ?, retry_after_ns = ?,
+                    last_error = ?, last_attempt_at_ns = ?
+              WHERE message_id = ? AND attachment_id = ?",
+        )
+        .bind(next.counts.attempts)
+        .bind(next.counts.transient_failures)
+        .bind(next.retry_after_ns)
+        .bind(&failure.detail)
+        .bind(now_ns)
+        .bind(message_id)
+        .bind(attachment_id)
+        .execute(&mut *tx)
+        .await?;
+        if next.exhausted && !already_failed {
+            set_attachment_failed(&mut tx, message_id, attachment_id, now_ns).await?;
+        }
+        let entry = FailureEntry {
+            stage: FailureStage::Attachment,
+            permanent: failure.permanent,
+            message_id,
+            attachment_id,
+            day: String::new(),
+            detail: &failure.detail,
+        };
+        insert_failure(&mut tx, &entry, now_ns).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Logs a failure to list one Oslo calendar day.
+    pub async fn record_list_failure(
+        &self,
+        day: Date,
+        detail: &str,
+        now_ns: i64,
+    ) -> Result<(), StoreError> {
+        let entry = FailureEntry {
+            stage: FailureStage::List,
+            permanent: false,
+            message_id: 0,
+            attachment_id: 0,
+            day: day.to_string(),
+            detail,
+        };
+        let mut connection = self.pool.acquire().await?;
+        insert_failure(&mut connection, &entry, now_ns).await
+    }
+
+    /// Up to `limit` rows of the failure log, newest first.
+    pub async fn failures(&self, limit: u32) -> Result<Vec<FailureRecord>, StoreError> {
+        let rows: Vec<FailureRow> = sqlx::query_as(
+            "SELECT id, at_ns, stage, permanent, message_id, attachment_id, day, detail
+               FROM failures ORDER BY id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(FailureRecord::try_from).collect()
+    }
+
+    /// Records the result of listing a day, replacing an earlier one.
+    pub async fn record_listed_day(&self, listed: &ListedDay) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO listed_days
+                    (day, listed_at_ns, rows, overflow, undecodable, sealed)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(listed.day.to_string())
+        .bind(listed.listed_at_ns)
+        .bind(listed.rows)
+        .bind(listed.overflow)
+        .bind(listed.undecodable)
+        .bind(listed.sealed)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The listed days from `from` to `to`, both included, in ascending order.
+    pub async fn listed_days(&self, from: Date, to: Date) -> Result<Vec<ListedDay>, StoreError> {
+        // `YYYY-MM-DD` text orders as the dates do.
+        let rows: Vec<ListedDayRow> = sqlx::query_as(
+            "SELECT day, listed_at_ns, rows, overflow, undecodable, sealed
+               FROM listed_days WHERE day BETWEEN ? AND ? ORDER BY day",
+        )
+        .bind(from.to_string())
+        .bind(to.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(ListedDay::try_from).collect()
     }
 
     /// Records that an attachment's bytes are stored, and writes
@@ -193,22 +573,7 @@ impl Store {
         now_ns: i64,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
-        let updated = sqlx::query(
-            "UPDATE attachments SET state = ? WHERE message_id = ? AND attachment_id = ?",
-        )
-        .bind(attachment::State::Failed as i32)
-        .bind(message_id)
-        .bind(attachment_id)
-        .execute(&mut *tx)
-        .await?;
-        if updated.rows_affected() == 0 {
-            return Err(StoreError::NoAttachment {
-                message_id,
-                attachment_id,
-            });
-        }
-        let kind = event::Kind::AttachmentFailed;
-        write_event(&mut tx, kind, message_id, attachment_id, now_ns).await?;
+        set_attachment_failed(&mut tx, message_id, attachment_id, now_ns).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -326,11 +691,177 @@ fn full_read(stored: Option<&StoredDocument>, document: &str) -> FullRead {
     }
 }
 
-/// What `store_message` compares an incoming message with.
+/// What storing a row of the list changes for a disclosure already stored.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ListedChange {
+    /// The listed fields are those of the stored document.
+    Unchanged,
+    /// The stored list row is replaced with the new one.
+    NewListRow,
+    /// The disclosure is read in full and is marked to be read again.
+    Reread,
+}
+
+/// Compares the listed fields of a row of the list with those of the stored
+/// document, which is read as a list row whether or not it is the full
+/// message. A stored document that does not decode counts as changed.
+fn listed_change(stored: &StoredDocument, listed: &Disclosure) -> ListedChange {
+    let unchanged = exchange::decode_document(&stored.document, false)
+        .is_ok_and(|stored_row| stored_row == *listed);
+    match (unchanged, stored.read_in_full) {
+        (true, _) => ListedChange::Unchanged,
+        (false, false) => ListedChange::NewListRow,
+        (false, true) => ListedChange::Reread,
+    }
+}
+
+/// The failure counters of a disclosure or an attachment.
+#[derive(Debug, Clone, Copy, PartialEq, sqlx::FromRow)]
+struct RetryCounts {
+    attempts: u32,
+    transient_failures: u32,
+}
+
+/// The failure counters after one more failure, and when to try again.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AfterFailure {
+    counts: RetryCounts,
+    retry_after_ns: i64,
+    /// The failure was permanent, and the permanent failures reached
+    /// `MAX_PERMANENT_FAILURES`.
+    exhausted: bool,
+}
+
+/// A transient failure adds to the run of transient failures and leaves the
+/// permanent ones as they are. A permanent failure adds to the permanent
+/// ones and ends the run of transient ones. Either delays the next try by
+/// `retry_delay_ns` of the count it raised.
+fn after_failure(current: RetryCounts, permanent: bool, now_ns: i64) -> AfterFailure {
+    let counts = if permanent {
+        RetryCounts {
+            attempts: current.attempts.saturating_add(1),
+            transient_failures: 0,
+        }
+    } else {
+        RetryCounts {
+            attempts: current.attempts,
+            transient_failures: current.transient_failures.saturating_add(1),
+        }
+    };
+    let raised = if permanent {
+        counts.attempts
+    } else {
+        counts.transient_failures
+    };
+    AfterFailure {
+        counts,
+        retry_after_ns: now_ns.saturating_add(retry_delay_ns(raised)),
+        exhausted: permanent && counts.attempts >= MAX_PERMANENT_FAILURES,
+    }
+}
+
+/// What `store_message` and `store_list_entry` compare an incoming
+/// disclosure with.
 #[derive(Debug, sqlx::FromRow)]
 struct StoredDocument {
     read_in_full: bool,
     document: String,
+}
+
+/// The failure counters of an attachment, and its state.
+#[derive(Debug, sqlx::FromRow)]
+struct AttachmentRetryCounts {
+    state: i32,
+    #[sqlx(flatten)]
+    counts: RetryCounts,
+}
+
+/// A row of the queue of `pending_attachments`.
+#[derive(Debug, sqlx::FromRow)]
+struct AttachmentRefRow {
+    message_id: i64,
+    attachment_id: i64,
+}
+
+/// A row of `failures` as `failures` selects it.
+#[derive(Debug, sqlx::FromRow)]
+struct FailureRow {
+    id: i64,
+    at_ns: i64,
+    stage: i64,
+    permanent: bool,
+    message_id: i64,
+    attachment_id: i64,
+    day: String,
+    detail: String,
+}
+
+impl TryFrom<FailureRow> for FailureRecord {
+    type Error = StoreError;
+
+    fn try_from(row: FailureRow) -> Result<Self, StoreError> {
+        let stage = FailureStage::from_code(row.stage).ok_or(StoreError::FailureStage {
+            id: row.id,
+            stage: row.stage,
+        })?;
+        let day = match row.day.as_str() {
+            "" => None,
+            _ => Some(parse_day(row.day)?),
+        };
+        Ok(Self {
+            id: row.id,
+            at_ns: row.at_ns,
+            stage,
+            permanent: row.permanent,
+            message_id: row.message_id,
+            attachment_id: row.attachment_id,
+            day,
+            detail: row.detail,
+        })
+    }
+}
+
+/// A row of `failures` to insert.
+struct FailureEntry<'a> {
+    stage: FailureStage,
+    permanent: bool,
+    message_id: i64,
+    attachment_id: i64,
+    /// `YYYY-MM-DD`, or '' when the stage is not `List`.
+    day: String,
+    detail: &'a str,
+}
+
+/// A row of `listed_days`.
+#[derive(Debug, sqlx::FromRow)]
+struct ListedDayRow {
+    day: String,
+    listed_at_ns: i64,
+    rows: u32,
+    overflow: bool,
+    undecodable: u32,
+    sealed: bool,
+}
+
+impl TryFrom<ListedDayRow> for ListedDay {
+    type Error = StoreError;
+
+    fn try_from(row: ListedDayRow) -> Result<Self, StoreError> {
+        Ok(Self {
+            day: parse_day(row.day)?,
+            listed_at_ns: row.listed_at_ns,
+            rows: row.rows,
+            overflow: row.overflow,
+            undecodable: row.undecodable,
+            sealed: row.sealed,
+        })
+    }
+}
+
+fn parse_day(value: String) -> Result<Date, StoreError> {
+    value
+        .parse()
+        .map_err(|source| StoreError::Day { value, source })
 }
 
 /// A row of `disclosures` as the reads select it.
@@ -410,6 +941,74 @@ async fn update_disclosure(
     .bind(disclosure.correction_for_message_id)
     .bind(&message.document)
     .bind(disclosure.message_id)
+    .execute(connection)
+    .await?;
+    Ok(())
+}
+
+/// Replaces a stored list row with a newer one. `received_at_ns` stays.
+async fn replace_list_row(
+    connection: &mut SqliteConnection,
+    entry: &Fetched,
+) -> Result<(), StoreError> {
+    let disclosure = &entry.disclosure;
+    sqlx::query(
+        "UPDATE disclosures
+            SET published_at_ns = ?, issuer_sign = ?, is_test = ?,
+                correction_for_message_id = ?, document = ?
+          WHERE message_id = ? AND read_in_full = 0",
+    )
+    .bind(disclosure.published_at_ns)
+    .bind(issuer_sign(disclosure))
+    .bind(disclosure.test)
+    .bind(disclosure.correction_for_message_id)
+    .bind(&entry.document)
+    .bind(disclosure.message_id)
+    .execute(connection)
+    .await?;
+    Ok(())
+}
+
+/// Sets an attachment's state to FAILED and writes `ATTACHMENT_FAILED`.
+async fn set_attachment_failed(
+    connection: &mut SqliteConnection,
+    message_id: i64,
+    attachment_id: i64,
+    now_ns: i64,
+) -> Result<(), StoreError> {
+    let updated =
+        sqlx::query("UPDATE attachments SET state = ? WHERE message_id = ? AND attachment_id = ?")
+            .bind(attachment::State::Failed as i32)
+            .bind(message_id)
+            .bind(attachment_id)
+            .execute(&mut *connection)
+            .await?;
+    if updated.rows_affected() == 0 {
+        return Err(StoreError::NoAttachment {
+            message_id,
+            attachment_id,
+        });
+    }
+    let kind = event::Kind::AttachmentFailed;
+    write_event(connection, kind, message_id, attachment_id, now_ns).await
+}
+
+async fn insert_failure(
+    connection: &mut SqliteConnection,
+    entry: &FailureEntry<'_>,
+    now_ns: i64,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO failures (at_ns, stage, permanent, message_id, attachment_id, day, detail)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(now_ns)
+    .bind(entry.stage.code())
+    .bind(entry.permanent)
+    .bind(entry.message_id)
+    .bind(entry.attachment_id)
+    .bind(&entry.day)
+    .bind(entry.detail)
     .execute(connection)
     .await?;
     Ok(())
@@ -630,6 +1229,237 @@ mod tests {
                 "stored: {stored:?}"
             );
         }
+    }
+
+    #[test]
+    fn retry_delay_ns__consecutive_failures__doubles_from_one_minute_up_to_a_day() {
+        const MINUTE: i64 = 60_000_000_000;
+        const DAY: i64 = 1_440 * MINUTE;
+        let cases = [
+            (0, 0),
+            (1, MINUTE),
+            (2, 2 * MINUTE),
+            (3, 4 * MINUTE),
+            (11, 1_024 * MINUTE),
+            (12, DAY),
+            (64, DAY),
+            (u32::MAX, DAY),
+        ];
+        for (failures, expected) in cases {
+            assert_eq!(retry_delay_ns(failures), expected, "failures: {failures}");
+        }
+    }
+
+    const LIST_ROW: &str =
+        r#"{"messageId": 7, "publishedTime": "2026-09-22T12:00:00Z", "title": "Results"}"#;
+    const RETITLED_LIST_ROW: &str = r#"{"messageId": 7, "publishedTime": "2026-09-22T12:00:00Z", "title": "Results (updated)"}"#;
+
+    fn listed(document: &str) -> Disclosure {
+        exchange::decode_document(document, false).unwrap()
+    }
+
+    #[test]
+    fn listed_change__stored_document_and_new_row__names_the_change() {
+        let cases = [
+            (stored(false, LIST_ROW), LIST_ROW, ListedChange::Unchanged),
+            (
+                stored(false, LIST_ROW),
+                RETITLED_LIST_ROW,
+                ListedChange::NewListRow,
+            ),
+            (
+                stored(true, DOCUMENT),
+                RETITLED_LIST_ROW,
+                ListedChange::Reread,
+            ),
+            (
+                stored(false, "not json"),
+                LIST_ROW,
+                ListedChange::NewListRow,
+            ),
+            (stored(true, "not json"), LIST_ROW, ListedChange::Reread),
+        ];
+        for (stored, row, expected) in cases {
+            assert_eq!(
+                listed_change(&stored, &listed(row)),
+                expected,
+                "stored: {stored:?}, row: {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn listed_change__full_message_with_body_and_attachments__compares_only_listed_fields() {
+        let stored = stored(true, DOCUMENT);
+
+        let change = listed_change(&stored, &listed(LIST_ROW));
+
+        assert_eq!(change, ListedChange::Unchanged);
+    }
+
+    const NOW_NS: i64 = 1_790_078_460_000_000_000;
+    const MINUTE_LATER_NS: i64 = NOW_NS + 60_000_000_000;
+
+    fn counts(attempts: u32, transient_failures: u32) -> RetryCounts {
+        RetryCounts {
+            attempts,
+            transient_failures,
+        }
+    }
+
+    #[test]
+    fn after_failure__transient__adds_to_transient_failures_and_keeps_attempts() {
+        let next = after_failure(counts(2, 5), false, NOW_NS);
+
+        assert_eq!(next.counts, counts(2, 6));
+    }
+
+    #[test]
+    fn after_failure__permanent__adds_to_attempts_and_ends_the_transient_run() {
+        let next = after_failure(counts(1, 5), true, NOW_NS);
+
+        assert_eq!(next.counts, counts(2, 0));
+    }
+
+    #[test]
+    fn after_failure__first_transient__retries_a_minute_later() {
+        let next = after_failure(counts(0, 0), false, NOW_NS);
+
+        assert_eq!(next.retry_after_ns, MINUTE_LATER_NS);
+    }
+
+    #[test]
+    fn after_failure__first_permanent__retries_a_minute_later() {
+        let next = after_failure(counts(0, 7), true, NOW_NS);
+
+        assert_eq!(next.retry_after_ns, MINUTE_LATER_NS);
+    }
+
+    #[test]
+    fn after_failure__counts_and_kind__exhausted_only_at_the_maximum_permanent_failure() {
+        let cases = [
+            (counts(0, 0), true, false),
+            (counts(1, 0), true, false),
+            (counts(2, 0), true, true),
+            (counts(3, 0), true, true),
+            (counts(2, 0), false, false),
+            (counts(0, u32::MAX), false, false),
+            (counts(3, 0), false, false),
+        ];
+        for (current, permanent, expected) in cases {
+            assert_eq!(
+                after_failure(current, permanent, NOW_NS).exhausted,
+                expected,
+                "counts: {current:?}, permanent: {permanent}"
+            );
+        }
+    }
+
+    #[test]
+    fn after_failure__retry_time_beyond_i64__saturates() {
+        let next = after_failure(counts(0, 0), false, i64::MAX);
+
+        assert_eq!(next.retry_after_ns, i64::MAX);
+    }
+
+    fn failure_row(stage: i64, day: &str) -> FailureRow {
+        FailureRow {
+            id: 4,
+            at_ns: NOW_NS,
+            stage,
+            permanent: false,
+            message_id: 0,
+            attachment_id: 0,
+            day: day.to_owned(),
+            detail: "HTTP 503".to_owned(),
+        }
+    }
+
+    #[test]
+    fn failure_record_try_from__stage_codes__returns_the_stage() {
+        let cases = [
+            (1, FailureStage::List),
+            (2, FailureStage::Read),
+            (3, FailureStage::Attachment),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(
+                FailureRecord::try_from(failure_row(code, ""))
+                    .unwrap()
+                    .stage,
+                expected,
+                "code: {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_stage_code__every_stage__reads_back_as_itself() {
+        let stages = [
+            FailureStage::List,
+            FailureStage::Read,
+            FailureStage::Attachment,
+        ];
+        for stage in stages {
+            assert_eq!(FailureStage::from_code(stage.code()), Some(stage));
+        }
+    }
+
+    #[test]
+    fn failure_record_try_from__unknown_stage__returns_error_naming_row_and_stage() {
+        let error = FailureRecord::try_from(failure_row(9, "")).unwrap_err();
+
+        assert_eq!(error.to_string(), "failure 4: stage 9 is not a stage");
+    }
+
+    #[test]
+    fn failure_record_try_from__day_set__returns_the_date() {
+        let record = FailureRecord::try_from(failure_row(1, "2026-09-22")).unwrap();
+
+        assert_eq!(record.day, Some(Date::constant(2026, 9, 22)));
+    }
+
+    #[test]
+    fn failure_record_try_from__day_empty__returns_no_date() {
+        let record = FailureRecord::try_from(failure_row(2, "")).unwrap();
+
+        assert_eq!(record.day, None);
+    }
+
+    fn listed_day_row(day: &str) -> ListedDayRow {
+        ListedDayRow {
+            day: day.to_owned(),
+            listed_at_ns: NOW_NS,
+            rows: 214,
+            overflow: false,
+            undecodable: 1,
+            sealed: true,
+        }
+    }
+
+    #[test]
+    fn listed_day_try_from__row__returns_the_day_and_its_counts() {
+        let listed = ListedDay::try_from(listed_day_row("2026-09-22")).unwrap();
+
+        let expected = ListedDay {
+            day: Date::constant(2026, 9, 22),
+            listed_at_ns: NOW_NS,
+            rows: 214,
+            overflow: false,
+            undecodable: 1,
+            sealed: true,
+        };
+        assert_eq!(listed, expected);
+    }
+
+    #[test]
+    fn listed_day_try_from__day_not_a_date__returns_error_naming_the_value() {
+        let error = ListedDay::try_from(listed_day_row("22.09.2026")).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            r#"the stored day "22.09.2026" is not a date"#
+        );
     }
 
     #[test]
