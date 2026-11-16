@@ -144,7 +144,7 @@ pub fn decode_list(body: &[u8]) -> Result<Page, DecodeError> {
         match list_row(row) {
             Ok(entry) => entries.push(entry),
             Err(error) => {
-                tracing::warn!(%error, "a row of the list does not decode");
+                tracing::warn!(error = %crate::logging::chain(&error), "a row of the list does not decode");
                 undecodable += 1;
             }
         }

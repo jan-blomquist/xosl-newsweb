@@ -7,6 +7,7 @@
 //! after a failure to reach the host, so the client follows the API when the
 //! exchange moves it.
 
+use std::error::Error;
 use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable};
@@ -16,6 +17,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use super::{DecodeError, Fetched, Page};
+use crate::logging;
 
 /// Retries of one call after its first try; the waits before them are 2 s
 /// and 8 s.
@@ -45,6 +47,21 @@ pub enum ClientError {
 }
 
 impl ClientError {
+    /// The URL the failed request was sent to.
+    fn url(&self) -> &str {
+        match self {
+            Self::Transport { url, .. } | Self::Decode { url, .. } => url,
+        }
+    }
+
+    /// The failure without the URL, which `Display` puts first.
+    fn cause(&self) -> &(dyn Error + 'static) {
+        match self {
+            Self::Transport { source, .. } => source,
+            Self::Decode { source, .. } => source,
+        }
+    }
+
     /// A permanent failure is one a retry cannot change: the exchange states
     /// that the resource does not exist. Every other failure is transient.
     pub fn is_permanent(&self) -> bool {
@@ -253,6 +270,14 @@ impl<T: Transport> Client<T> {
         (|| self.try_call(&url, &decode))
             .retry(retries)
             .when(|error| !error.is_permanent())
+            .notify(|error, delay| {
+                tracing::warn!(
+                    url = error.url(),
+                    error = %logging::chain(error.cause()),
+                    delay_ms = duration_ms(delay),
+                    "request failed, trying again"
+                );
+            })
             .await
     }
 
@@ -277,13 +302,18 @@ impl<T: Transport> Client<T> {
 
     async fn get(&self, url: &str) -> Result<Bytes, ClientError> {
         self.limiter.wait().await;
-        self.transport
-            .get(url)
-            .await
-            .map_err(|source| ClientError::Transport {
-                url: url.to_owned(),
-                source,
-            })
+        let started = Instant::now();
+        let result = self.transport.get(url).await;
+        tracing::debug!(
+            url,
+            ok = result.is_ok(),
+            duration_ms = duration_ms(started.elapsed()),
+            "request done"
+        );
+        result.map_err(|source| ClientError::Transport {
+            url: url.to_owned(),
+            source,
+        })
     }
 
     /// The API's base URL, read from `urls.json` when not known.
@@ -309,13 +339,20 @@ impl<T: Transport> Client<T> {
     /// the last minute.
     async fn forget_api_base(&self) {
         let mut api_base = self.api_base.lock().await;
-        if api_base
-            .as_ref()
-            .is_some_and(|known| known.resolved_at.elapsed() >= API_BASE_MIN_AGE)
+        if let Some(known) = api_base.as_ref()
+            && known.resolved_at.elapsed() >= API_BASE_MIN_AGE
         {
+            tracing::warn!(
+                api_base = known.url,
+                "the API seems to have moved: reading urls.json again"
+            );
             *api_base = None;
         }
     }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

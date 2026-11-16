@@ -10,12 +10,15 @@ use serde_json::{Value, json};
 use xosl_newsweb::exchange::{self, Fetched};
 use xosl_newsweb::pb::{DisclosureFilter, attachment, event};
 use xosl_newsweb::store::{
-    AttachmentRef, Failure, FailureRecord, FailureStage, ListedDay, Position, Store, StoredFile,
+    AttachmentRef, Failure, FailureRecord, FailureStage, ListedDay, Position, QueueSizes, Retry,
+    Store, StoredFile,
 };
 
 const NOON_NS: i64 = 1_790_078_400_000_000_000;
 const NOW_NS: i64 = NOON_NS + 60_000_000_000;
 const LATER_NS: i64 = NOW_NS + 60_000_000_000;
+/// The first retry delay after a failure at `NOW_NS`: one minute.
+const ONE_MINUTE_AFTER_NOW_NS: i64 = NOW_NS + 60_000_000_000;
 /// Within the first retry delay, one minute, of a failure at `NOW_NS`.
 const HALF_A_MINUTE_LATER_NS: i64 = NOW_NS + 30_000_000_000;
 /// Beyond every retry delay of a failure at `NOW_NS`.
@@ -1312,4 +1315,162 @@ async fn store_message__after_two_permanent_failures__gives_a_later_reread_the_f
     let far_future_ns = LATER_NS + 365 * 24 * 3_600_000_000_000;
     let queue = store.unread_disclosures(far_future_ns, 10).await.unwrap();
     assert_eq!(queue, [1]);
+}
+
+// The return values of the failure records.
+
+#[tokio::test]
+async fn record_read_failure__first_transient_failure__returns_a_retry_one_minute_later() {
+    let store = store().await;
+    store
+        .store_list_entry(&listed(&message(1)), NOW_NS)
+        .await
+        .unwrap();
+
+    let retry = store
+        .record_read_failure(1, &transient(), NOW_NS)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        retry,
+        Retry::At {
+            at_ns: ONE_MINUTE_AFTER_NOW_NS
+        }
+    );
+}
+
+#[tokio::test]
+async fn record_read_failure__third_permanent_failure__returns_never() {
+    let store = store().await;
+    store
+        .store_list_entry(&listed(&message(1)), NOW_NS)
+        .await
+        .unwrap();
+    record_read_failures(&store, 1, &permanent(), 2).await;
+
+    let retry = store
+        .record_read_failure(1, &permanent(), NOW_NS)
+        .await
+        .unwrap();
+
+    assert_eq!(retry, Retry::Never);
+}
+
+#[tokio::test]
+async fn record_read_failure__transient_failure_of_a_failed_disclosure__returns_never() {
+    let store = store().await;
+    store
+        .store_list_entry(&listed(&message(1)), NOW_NS)
+        .await
+        .unwrap();
+    record_read_failures(&store, 1, &permanent(), 3).await;
+
+    let retry = store
+        .record_read_failure(1, &transient(), NOW_NS)
+        .await
+        .unwrap();
+
+    assert_eq!(retry, Retry::Never);
+}
+
+#[tokio::test]
+async fn record_attachment_failure__first_transient_failure__returns_a_retry_one_minute_later() {
+    let store = store_with_attachment().await;
+
+    let retry = store
+        .record_attachment_failure(1, 9, &transient(), NOW_NS)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        retry,
+        Retry::At {
+            at_ns: ONE_MINUTE_AFTER_NOW_NS
+        }
+    );
+}
+
+#[tokio::test]
+async fn record_attachment_failure__third_permanent_failure__returns_never() {
+    let store = store_with_attachment().await;
+    record_attachment_failures(&store, 1, 9, &permanent(), 2).await;
+
+    let retry = store
+        .record_attachment_failure(1, 9, &permanent(), NOW_NS)
+        .await
+        .unwrap();
+
+    assert_eq!(retry, Retry::Never);
+}
+
+// The sizes of the queues.
+
+#[tokio::test]
+async fn queue_sizes__empty_store__counts_nothing() {
+    let store = store().await;
+
+    let sizes = store.queue_sizes().await.unwrap();
+
+    assert_eq!(sizes, QueueSizes::default());
+}
+
+#[tokio::test]
+async fn queue_sizes__listed_disclosure_waiting_for_its_retry__counts_it_unread() {
+    let store = store().await;
+    store
+        .store_list_entry(&listed(&message(1)), NOW_NS)
+        .await
+        .unwrap();
+    store
+        .record_read_failure(1, &transient(), NOW_NS)
+        .await
+        .unwrap();
+
+    let sizes = store.queue_sizes().await.unwrap();
+
+    assert_eq!(
+        sizes,
+        QueueSizes {
+            unread_disclosures: 1,
+            ..QueueSizes::default()
+        }
+    );
+}
+
+#[tokio::test]
+async fn queue_sizes__disclosure_read_in_full_with_an_attachment__counts_one_pending_attachment() {
+    let store = store_with_attachment().await;
+
+    let sizes = store.queue_sizes().await.unwrap();
+
+    assert_eq!(
+        sizes,
+        QueueSizes {
+            pending_attachments: 1,
+            ..QueueSizes::default()
+        }
+    );
+}
+
+#[tokio::test]
+async fn queue_sizes__failed_disclosure_and_failed_attachment__counts_each_failed_only() {
+    let store = store_with_attachment().await;
+    store
+        .store_list_entry(&listed(&message(2)), NOW_NS)
+        .await
+        .unwrap();
+    record_read_failures(&store, 2, &permanent(), 3).await;
+    record_attachment_failures(&store, 1, 9, &permanent(), 3).await;
+
+    let sizes = store.queue_sizes().await.unwrap();
+
+    assert_eq!(
+        sizes,
+        QueueSizes {
+            failed_disclosures: 1,
+            failed_attachments: 1,
+            ..QueueSizes::default()
+        }
+    );
 }

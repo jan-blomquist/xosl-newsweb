@@ -9,5 +9,6 @@ pub mod clock;
 pub mod exchange;
 pub mod files;
 pub mod ingest;
+pub mod logging;
 pub mod pb;
 pub mod store;
