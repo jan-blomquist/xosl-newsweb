@@ -20,7 +20,7 @@ use jiff::Timestamp;
 use jiff::civil::Date;
 
 use crate::pb::raw;
-use crate::pb::{Attachment, Disclosure, Instrument, Issuer, attachment};
+use crate::pb::{Attachment, Category, Disclosure, Instrument, Issuer, attachment};
 
 /// One disclosure as fetched: the exchange's JSON for it, and that JSON
 /// decoded.
@@ -235,15 +235,19 @@ fn list_entry(message: &raw::Message) -> Result<Disclosure, DecodeError> {
         markets: message.markets.clone(),
         published_at_ns: published_at_ns(message)?,
         title: sanitize_text(&message.title),
-        category_ids: message
-            .category
-            .iter()
-            .map(|category| category.id)
-            .collect(),
+        categories: message.category.iter().map(category).collect(),
         test: message.test,
         correction_for_message_id: message.correction_for_message_id,
         ..Default::default()
     })
+}
+
+fn category(category: &raw::Category) -> Category {
+    Category {
+        id: category.id,
+        name_no: sanitize_text(&category.category_no),
+        name_en: sanitize_text(&category.category_en),
+    }
 }
 
 fn full_disclosure(message: &raw::Message) -> Result<Disclosure, DecodeError> {
@@ -417,8 +421,20 @@ mod tests {
         assert_eq!(disclosure.message_id, 700001);
         assert_eq!(disclosure.news_id, 650001);
         assert_eq!(disclosure.published_at_ns, PUBLISHED_AT_NS);
-        assert_eq!(disclosure.category_ids, [1002]);
+        assert_eq!(disclosure.categories[0].id, 1002);
         assert_eq!(disclosure.correction_for_message_id, 699990);
+    }
+
+    #[test]
+    fn decode_list__row_with_a_category__returns_its_id_and_both_names() {
+        let page = decode_list(&list_response(LIST_ROW, false)).unwrap();
+
+        let expected = Category {
+            id: 1002,
+            name_no: "HALVÅRSRAPPORT".into(),
+            name_en: "HALF YEAR FINANCIAL REPORT".into(),
+        };
+        assert_eq!(page.entries[0].disclosure.categories, [expected]);
     }
 
     #[test]

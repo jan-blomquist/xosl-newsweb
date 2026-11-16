@@ -3,20 +3,26 @@
 //! Each setting is a flag and an environment variable, defined once here;
 //! `--help` lists them.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::builder::BoolishValueParser;
 use clap::{Args, Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
+use tonic::service::Routes;
 use url::Url;
 
 use crate::clock::{Clock, SystemClock};
 use crate::exchange::client::{Client, Exchange, HttpTransport};
 use crate::files::{Files, FilesError};
+use crate::health::{self, CHECK_TIMEOUT, EVALUATION_INTERVAL, ServeError};
 use crate::ingest::{self, JobSettings, Jobs};
 use crate::logging::{self, InitError, LogFormat};
+use crate::pb::newsweb_service_server::NewswebServiceServer;
+use crate::server::{MirrorService, StatusSettings};
 use crate::store::{Store, StoreError};
 
 /// The database file, in the data folder.
@@ -37,6 +43,23 @@ pub enum Command {
     /// Opens the mirror's data folder and, with --ingest, copies NewsWeb into
     /// it until SIGINT or SIGTERM.
     Run(RunSettings),
+
+    /// Asks a running mirror whether it is healthy. Prints `healthy`,
+    /// `unhealthy` or `unreachable: <cause>`; exits with 0 only when healthy.
+    Health(HealthSettings),
+}
+
+/// The settings of `health`.
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct HealthSettings {
+    /// The address of the mirror's gRPC server.
+    #[arg(
+        long,
+        env = "XOSL_NEWSWEB_HEALTH_ADDRESS",
+        value_name = "ADDRESS",
+        default_value = "http://127.0.0.1:50051"
+    )]
+    pub address: String,
 }
 
 /// The settings of `run`.
@@ -88,6 +111,15 @@ pub struct RunSettings {
         value_parser = lookback_days
     )]
     pub lookback_days: u32,
+
+    /// The address of the gRPC server, host and port.
+    #[arg(
+        long,
+        env = "XOSL_NEWSWEB_LISTEN",
+        value_name = "ADDRESS",
+        default_value = "127.0.0.1:50051"
+    )]
+    pub listen: SocketAddr,
 
     /// How log lines are written to stderr: text, or one JSON object per
     /// line. The level is set by RUST_LOG; the default is info.
@@ -172,6 +204,14 @@ pub enum RunError {
     Files(#[from] FilesError),
     #[error("cannot create the HTTP client")]
     Http(#[source] reqwest::Error),
+    #[error("cannot listen on {address}")]
+    Listen {
+        address: SocketAddr,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Serve(#[from] ServeError),
     #[error("cannot listen for SIGINT and SIGTERM")]
     Signal(#[source] std::io::Error),
 }
@@ -179,9 +219,15 @@ pub enum RunError {
 /// The entry point of the binary.
 pub async fn main() -> ExitCode {
     let cli = Cli::parse();
-    let result = match cli.command {
-        Command::Run(settings) => run(&settings).await,
+    let settings = match cli.command {
+        Command::Run(settings) => settings,
+        Command::Health(settings) => {
+            let outcome = health::check(&settings.address, CHECK_TIMEOUT).await;
+            println!("{outcome}");
+            return ExitCode::from(outcome.exit_code());
+        }
     };
+    let result = run(&settings).await;
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -214,6 +260,7 @@ fn log_start(settings: &RunSettings) {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         data_dir = %data_dir.display(),
+        listen = %settings.listen,
         ingest = settings.ingest,
         request_interval_ms = settings.request_interval_ms,
         poll_interval_secs = settings.poll_interval_secs,
@@ -225,24 +272,68 @@ fn log_start(settings: &RunSettings) {
 
 async fn run_logged(settings: &RunSettings) -> Result<(), RunError> {
     let layout = open_data_dir(&settings.data_dir)?;
-    let store = Store::open(&layout.database).await?;
-    let files = Files::open(layout.attachments.as_str(), [])?;
+    let store = Arc::new(Store::open(&layout.database).await?);
+    let files = Arc::new(Files::open(layout.attachments.as_str(), [])?);
     // Creating the client sends no request; with ingest off it is not used.
     let transport = HttpTransport::new().map_err(RunError::Http)?;
     let client = Client::new(transport, settings.request_interval());
     let jobs = Jobs::new(&store, &files, &client, &SystemClock);
+    let listener = tokio::net::TcpListener::bind(settings.listen)
+        .await
+        .map_err(|source| RunError::Listen {
+            address: settings.listen,
+            source,
+        })?;
 
     let mirror_settings = settings.mirror_settings();
+    let service = MirrorService::new(
+        Arc::clone(&store),
+        Arc::clone(&files),
+        Arc::clone(jobs.states()),
+        SystemClock,
+        StatusSettings {
+            ingest_enabled: mirror_settings.ingest,
+            lookback_days: mirror_settings.jobs.lookback_days,
+        },
+    );
+    let services = Routes::new(NewswebServiceServer::new(service));
+    let started_at_ns = SystemClock.now_ns();
+    let states = Arc::clone(jobs.states());
+    let evaluate = move || {
+        health::health(
+            &states.snapshot(),
+            mirror_settings.ingest,
+            SystemClock.now_ns(),
+            started_at_ns,
+            mirror_settings.jobs.poll_interval,
+        )
+    };
+
+    // Either part ending, with an error or not, stops the other.
     let shutdown = CancellationToken::new();
-    let mirror = run_mirror(&jobs, &mirror_settings, &shutdown);
-    tokio::pin!(mirror);
+    let mirror = async {
+        let result = run_mirror(&jobs, &mirror_settings, &shutdown).await;
+        shutdown.cancel();
+        result.map_err(RunError::from)
+    };
+    let server = async {
+        let result =
+            health::serve(listener, services, evaluate, EVALUATION_INTERVAL, &shutdown).await;
+        shutdown.cancel();
+        result.map_err(RunError::from)
+    };
+    let both = async {
+        let (mirror, server) = tokio::join!(mirror, server);
+        mirror.and(server)
+    };
+    tokio::pin!(both);
     tokio::select! {
-        result = &mut mirror => return result.map_err(RunError::from),
+        result = &mut both => return result,
         signal = shutdown_signal() => signal.map_err(RunError::Signal)?,
     }
     tracing::info!("stopping");
     shutdown.cancel();
-    mirror.await?;
+    both.await?;
     tracing::info!("stopped");
     Ok(())
 }
@@ -327,8 +418,18 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<RunSettings, clap::Error> {
         let args = ["xosl-newsweb", "run"].iter().chain(args);
-        let Command::Run(settings) = Cli::try_parse_from(args)?.command;
-        Ok(settings)
+        match Cli::try_parse_from(args)?.command {
+            Command::Run(settings) => Ok(settings),
+            Command::Health(_) => unreachable!("the arguments start with `run`"),
+        }
+    }
+
+    fn parse_health(args: &[&str]) -> Result<HealthSettings, clap::Error> {
+        let args = ["xosl-newsweb", "health"].iter().chain(args);
+        match Cli::try_parse_from(args)?.command {
+            Command::Health(settings) => Ok(settings),
+            Command::Run(_) => unreachable!("the arguments start with `health`"),
+        }
     }
 
     #[test]
@@ -346,6 +447,7 @@ mod tests {
             request_interval_ms: 1000,
             poll_interval_secs: 60,
             lookback_days: 7,
+            listen: "127.0.0.1:50051".parse().unwrap(),
             log_format: LogFormat::Text,
         };
         assert_eq!(settings, expected);
@@ -363,6 +465,8 @@ mod tests {
             "5",
             "--lookback-days",
             "30",
+            "--listen",
+            "0.0.0.0:6000",
             "--log-format",
             "json",
         ];
@@ -375,6 +479,7 @@ mod tests {
             request_interval_ms: 1500,
             poll_interval_secs: 5,
             lookback_days: 30,
+            listen: "0.0.0.0:6000".parse().unwrap(),
             log_format: LogFormat::Json,
         };
         assert_eq!(settings, expected);
@@ -419,6 +524,27 @@ mod tests {
                 "flag: {flag}, message: {message}"
             );
         }
+    }
+
+    #[test]
+    fn parse__listen_not_an_address__returns_error_naming_the_setting() {
+        let message = parse(&["--listen", "everywhere"]).unwrap_err().to_string();
+
+        assert!(message.contains("--listen"), "message: {message}");
+    }
+
+    #[test]
+    fn parse_health__no_flags__returns_the_default_address() {
+        let settings = parse_health(&[]).unwrap();
+
+        assert_eq!(settings.address, "http://127.0.0.1:50051");
+    }
+
+    #[test]
+    fn parse_health__address_flag__returns_it() {
+        let settings = parse_health(&["--address", "http://mirror:6000"]).unwrap();
+
+        assert_eq!(settings.address, "http://mirror:6000");
     }
 
     #[test]

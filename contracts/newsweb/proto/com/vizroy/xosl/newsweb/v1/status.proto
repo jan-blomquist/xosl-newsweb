@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+package com.vizroy.xosl.newsweb.v1;
+
+// What the mirror holds and how its ingest is doing, at one instant.
+message Status {
+  // The version of the mirror.
+  string version = 1;
+  // False: the mirror serves what it holds and sends the exchange no
+  // request. `jobs` is then empty.
+  bool ingest_enabled = 2;
+  repeated JobStatus jobs = 3;
+  Coverage coverage = 4;
+  Counts counts = 5;
+  // The `seq` of the newest event; 0 when there is none.
+  int64 latest_seq = 6;
+}
+
+// One ingest job since the mirror started. A time is 0 until it has
+// happened.
+message JobStatus {
+  // "poller", "backfiller", "reader" or "downloader".
+  string name = 1;
+  // When the job last finished a round of work, with or without success.
+  int64 last_pass_ended_at_ns = 2;
+  // When the job last succeeded: a day listed, a disclosure read in full,
+  // an attachment stored.
+  int64 last_success_at_ns = 3;
+  int64 last_failure_at_ns = 4;
+  // The latest failure, in words; empty when there has been none.
+  string last_failure = 5;
+}
+
+// Which past days the mirror knows to be complete. A day is an Oslo calendar
+// day, written `YYYY-MM-DD`. The range starts `lookback_days` before today
+// and ends yesterday; the mirror makes no statement about earlier days.
+message Coverage {
+  string first_day = 1;
+  int32 lookback_days = 2;
+  // The days known to be complete, in ascending order.
+  repeated DayRange sealed = 3;
+  // The days not known to be complete, in ascending order.
+  repeated DayRange gaps = 4;
+  // The number of days in `gaps`.
+  int32 gap_days = 5;
+}
+
+// Consecutive days, both included.
+message DayRange {
+  string first = 1;
+  string last = 2;
+}
+
+message Counts {
+  int64 disclosures = 1;
+  // Disclosures waiting to be read in full.
+  int64 disclosures_unread = 2;
+  // Disclosures with `read_failed` set.
+  int64 disclosures_failed = 3;
+  int64 attachments_pending = 4;
+  int64 attachments_stored = 5;
+  int64 attachments_failed = 6;
+}
+
+// One failed attempt to list a day, read a disclosure in full or download
+// an attachment. Successes are not logged.
+message Failure {
+  enum Stage {
+    STAGE_UNSPECIFIED = 0;
+    // Listing one day.
+    STAGE_LIST = 1;
+    // Reading one disclosure in full.
+    STAGE_READ = 2;
+    // Downloading one attachment.
+    STAGE_ATTACHMENT = 3;
+  }
+
+  // Increases with every failure; never reused.
+  int64 id = 1;
+  int64 at_ns = 2;
+  Stage stage = 3;
+  // A retry cannot change the result: the exchange answered that the
+  // disclosure or the attachment does not exist.
+  bool permanent = 4;
+  // 0 for `STAGE_LIST`.
+  int64 message_id = 5;
+  // 0 unless `STAGE_ATTACHMENT`.
+  int64 attachment_id = 6;
+  // The day listed, `YYYY-MM-DD`, for `STAGE_LIST`; empty otherwise.
+  string day = 7;
+  // The failure, in words.
+  string detail = 8;
+}

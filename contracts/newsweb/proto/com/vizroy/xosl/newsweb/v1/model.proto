@@ -31,10 +31,9 @@ message Disclosure {
   // False while only the exchange's list entry is known: title, issuer and
   // time are set, body and attachments are not yet.
   bool read_in_full = 11;
-  // The exchange's category ids, as plain numbers. The exchange sends a
-  // list; in practice it holds exactly one. An id the exchange adds later
-  // arrives here unchanged.
-  repeated int32 category_ids = 12;
+  // The exchange's categories for the disclosure. The exchange sends a list;
+  // in practice it holds exactly one.
+  repeated Category categories = 12;
   repeated Attachment attachments = 13;
   // Regulatory flags, as the exchange states them. False until the
   // disclosure has been read in full.
@@ -49,6 +48,21 @@ message Disclosure {
   // the mirror once it holds a disclosure whose `correction_for_message_id`
   // names this one.
   int64 corrected_by_message_id = 18;
+  // The mirror could not read the disclosure in full and will not try again:
+  // the exchange answered that it does not exist, several times. Only the
+  // fields of the exchange's list are set.
+  bool read_failed = 19;
+}
+
+// A category as the exchange names it. The mirror keeps no list of
+// categories: the id and both names come with each disclosure, so a category
+// the exchange adds later arrives here unchanged.
+message Category {
+  int32 id = 1;
+  // The Norwegian name, in the exchange's capitals: "HALVÅRSRAPPORT".
+  string name_no = 2;
+  // The English name: "HALF YEAR FINANCIAL REPORT".
+  string name_en = 3;
 }
 
 message Issuer {
