@@ -1,0 +1,4 @@
+# A crate version is not chosen until it has been published for two weeks:
+# time for a bad release to be noticed before it reaches this build.
+[registry]
+global-min-publish-age = "14 days"

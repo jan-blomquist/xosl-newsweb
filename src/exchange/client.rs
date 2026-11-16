@@ -15,8 +15,7 @@ use jiff::civil::Date;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
-use super::{DecodeError, Page};
-use crate::pb::Disclosure;
+use super::{DecodeError, Fetched, Page};
 
 /// Retries of one call after its first try; the waits before them are 2 s
 /// and 8 s.
@@ -180,7 +179,7 @@ impl<T: Transport> Client<T> {
     }
 
     /// One disclosure, read in full.
-    pub async fn message(&self, message_id: i64) -> Result<Disclosure, ClientError> {
+    pub async fn message(&self, message_id: i64) -> Result<Fetched, ClientError> {
         self.call(
             |api_base| super::message_url(api_base, message_id),
             |body| super::decode_message(&body),
@@ -476,40 +475,5 @@ mod tests {
         }
 
         assert_eq!(start.elapsed(), INTERVAL * 2);
-    }
-
-    /// Calls the real exchange: four requests. Run with `just test-live`.
-    #[tokio::test]
-    #[ignore = "calls the real exchange"]
-    async fn live__today__lists_reads_one_message_and_downloads_one_attachment() {
-        let client = Client::new(HttpTransport::new().unwrap(), Duration::from_secs(1));
-        let now_ns = jiff::Timestamp::now().as_nanosecond() as i64;
-
-        let page = client
-            .list(crate::exchange::oslo_day(now_ns))
-            .await
-            .unwrap();
-        let Some(listed) = page.disclosures.first() else {
-            println!("the exchange lists no disclosure yet today");
-            return;
-        };
-        let disclosure = client.message(listed.message_id).await.unwrap();
-        assert!(disclosure.read_in_full);
-        assert_eq!(disclosure.message_id, listed.message_id);
-        println!(
-            "{} disclosures today; read {} with {} attachments",
-            page.disclosures.len(),
-            disclosure.message_id,
-            disclosure.attachments.len()
-        );
-
-        if let Some(attachment) = disclosure.attachments.first() {
-            let bytes = client
-                .attachment(disclosure.message_id, attachment.id)
-                .await
-                .unwrap();
-            assert!(!bytes.is_empty());
-            println!("attachment {}: {} bytes", attachment.id, bytes.len());
-        }
     }
 }

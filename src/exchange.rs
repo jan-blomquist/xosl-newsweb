@@ -14,9 +14,6 @@
 //!   instrument and regulatory flags read as zero whatever their real values.
 //!   Only `message` returns them.
 
-// Nothing calls this module until ingest is added.
-#![allow(dead_code)]
-
 pub mod client;
 
 use jiff::Timestamp;
@@ -25,12 +22,23 @@ use jiff::civil::Date;
 use crate::pb::raw;
 use crate::pb::{Attachment, Disclosure, Instrument, Issuer, attachment};
 
+/// One disclosure as fetched: the exchange's JSON for it, and that JSON
+/// decoded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fetched {
+    pub disclosure: Disclosure,
+    /// The exchange's JSON object for the disclosure, with every key it sent.
+    /// The store keeps it, so a later version of the decoder can read what
+    /// this one does not.
+    pub document: String,
+}
+
 /// The disclosures of one `list` response.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Page {
-    pub disclosures: Vec<Disclosure>,
+    pub entries: Vec<Fetched>,
     /// The exchange truncated the result: the day holds more disclosures than
-    /// `disclosures` does.
+    /// `entries` does.
     pub overflow: bool,
 }
 
@@ -110,24 +118,62 @@ pub fn oslo_day(at_ns: i64) -> Date {
 
 /// Decodes a `list` response. The disclosures are not read in full.
 pub fn decode_list(body: &[u8]) -> Result<Page, DecodeError> {
-    let response: raw::ListResponse = decode_json(body)?;
+    let envelope: serde_json::Value = decode_json(body)?;
+    let documents = documents_at(&envelope, "/data/messages");
+    let response: raw::ListResponse =
+        serde_json::from_value(envelope).map_err(DecodeError::NotEnvelope)?;
     let data = successful(response.header, response.data)?;
-    let disclosures = data
+    let entries = data
         .messages
         .iter()
-        .map(list_entry)
-        .collect::<Result<_, _>>()?;
+        .zip(documents)
+        .map(|(message, document)| {
+            Ok(Fetched {
+                disclosure: list_entry(message)?,
+                document,
+            })
+        })
+        .collect::<Result<_, DecodeError>>()?;
     Ok(Page {
-        disclosures,
+        entries,
         overflow: data.overflow,
     })
 }
 
 /// Decodes a `message` response: one disclosure, read in full.
-pub fn decode_message(body: &[u8]) -> Result<Disclosure, DecodeError> {
-    let response: raw::MessageResponse = decode_json(body)?;
+pub fn decode_message(body: &[u8]) -> Result<Fetched, DecodeError> {
+    let envelope: serde_json::Value = decode_json(body)?;
+    let document = envelope
+        .pointer("/data/message")
+        .map(serde_json::Value::to_string);
+    let response: raw::MessageResponse =
+        serde_json::from_value(envelope).map_err(DecodeError::NotEnvelope)?;
     let data = successful(response.header, response.data)?;
-    full_disclosure(&data.message.ok_or(DecodeError::NoData)?)
+    let message = data.message.ok_or(DecodeError::NoData)?;
+    Ok(Fetched {
+        disclosure: full_disclosure(&message)?,
+        document: document.ok_or(DecodeError::NoData)?,
+    })
+}
+
+/// Decodes a document that `decode_list` or `decode_message` returned.
+/// `read_in_full` states which of the two it came from.
+pub fn decode_document(document: &str, read_in_full: bool) -> Result<Disclosure, DecodeError> {
+    let message: raw::Message = decode_json(document.as_bytes())?;
+    if read_in_full {
+        full_disclosure(&message)
+    } else {
+        list_entry(&message)
+    }
+}
+
+/// The JSON text of each element of the array at `pointer`.
+fn documents_at(envelope: &serde_json::Value, pointer: &str) -> Vec<String> {
+    envelope
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_array)
+        .map(|messages| messages.iter().map(serde_json::Value::to_string).collect())
+        .unwrap_or_default()
 }
 
 /// Removes what a stored text must not hold: NUL and the other C0 control
@@ -336,7 +382,7 @@ mod tests {
     fn decode_list__code_200__returns_identities_and_publication_time() {
         let page = decode_list(&list_response(LIST_ROW, false)).unwrap();
 
-        let disclosure = &page.disclosures[0];
+        let disclosure = &page.entries[0].disclosure;
         assert_eq!(disclosure.message_id, 700001);
         assert_eq!(disclosure.news_id, 650001);
         assert_eq!(disclosure.published_at_ns, PUBLISHED_AT_NS);
@@ -348,7 +394,7 @@ mod tests {
     fn decode_list__issuer_name_padded__trims_it() {
         let page = decode_list(&list_response(LIST_ROW, false)).unwrap();
 
-        let issuer = page.disclosures[0].issuer.as_ref().unwrap();
+        let issuer = page.entries[0].disclosure.issuer.as_ref().unwrap();
         assert_eq!(issuer.name, "Example Shipping ASA");
         assert_eq!(issuer.sign, "EXSH");
     }
@@ -357,7 +403,7 @@ mod tests {
     fn decode_list__row_with_zero_instrument__leaves_instrument_unset() {
         let page = decode_list(&list_response(LIST_ROW, false)).unwrap();
 
-        let disclosure = &page.disclosures[0];
+        let disclosure = &page.entries[0].disclosure;
         assert_eq!(disclosure.instrument, None);
         assert!(!disclosure.read_in_full);
     }
@@ -375,7 +421,7 @@ mod tests {
 
         let page = decode_list(&list_response(row, false)).unwrap();
 
-        assert_eq!(page.disclosures[0].message_id, 1);
+        assert_eq!(page.entries[0].disclosure.message_id, 1);
     }
 
     #[test]
@@ -428,7 +474,9 @@ mod tests {
 
     #[test]
     fn decode_message__instrument_present__returns_instrument() {
-        let disclosure = decode_message(&message_response(MESSAGE)).unwrap();
+        let disclosure = decode_message(&message_response(MESSAGE))
+            .unwrap()
+            .disclosure;
 
         let instrument = disclosure.instrument.unwrap();
         assert_eq!(instrument.id, 1305676);
@@ -437,7 +485,9 @@ mod tests {
 
     #[test]
     fn decode_message__full_message__is_read_in_full_with_flags() {
-        let disclosure = decode_message(&message_response(MESSAGE)).unwrap();
+        let disclosure = decode_message(&message_response(MESSAGE))
+            .unwrap()
+            .disclosure;
 
         assert!(disclosure.read_in_full);
         assert!(disclosure.oam_mandatory);
@@ -446,7 +496,9 @@ mod tests {
 
     #[test]
     fn decode_message__two_attachments__returns_both_as_pending() {
-        let disclosure = decode_message(&message_response(MESSAGE)).unwrap();
+        let disclosure = decode_message(&message_response(MESSAGE))
+            .unwrap()
+            .disclosure;
 
         let ids: Vec<i64> = disclosure.attachments.iter().map(|a| a.id).collect();
         assert_eq!(ids, [340001, 340002]);
@@ -460,9 +512,38 @@ mod tests {
 
     #[test]
     fn decode_message__nul_in_body__removes_nul() {
-        let disclosure = decode_message(&message_response(MESSAGE)).unwrap();
+        let disclosure = decode_message(&message_response(MESSAGE))
+            .unwrap()
+            .disclosure;
 
         assert_eq!(disclosure.body, "Revenue rose.\nSee the attached report.");
+    }
+
+    #[test]
+    fn decode_list__key_the_decoder_does_not_name__keeps_it_in_the_document() {
+        let row = r#"{"messageId": 1, "publishedTime": "2026-01-01T00:00:00Z", "title": "t", "addedLater": 5}"#;
+
+        let page = decode_list(&list_response(row, false)).unwrap();
+
+        assert!(page.entries[0].document.contains(r#""addedLater":5"#));
+    }
+
+    #[test]
+    fn decode_document__document_of_a_message__equals_the_decoded_message() {
+        let fetched = decode_message(&message_response(MESSAGE)).unwrap();
+
+        let disclosure = decode_document(&fetched.document, true).unwrap();
+
+        assert_eq!(disclosure, fetched.disclosure);
+    }
+
+    #[test]
+    fn decode_document__document_of_a_list_row__equals_the_decoded_row() {
+        let page = decode_list(&list_response(LIST_ROW, false)).unwrap();
+
+        let disclosure = decode_document(&page.entries[0].document, false).unwrap();
+
+        assert_eq!(disclosure, page.entries[0].disclosure);
     }
 
     #[test]
