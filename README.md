@@ -36,23 +36,44 @@ nothing else to install:
 The same binary carries a command-line client for those calls, for people and
 for scripts.
 
-gRPC is the only way in. The database and the files are the mirror's own
-business, so nothing else should read them directly.
+gRPC is the only interface. The database schema and the file layout are
+internal and can change between versions, so no other program should read
+them directly.
 
-What it leaves to others: search, text extraction, classification and anything
-else derived from the disclosures. Those belong in the programs that consume
-the mirror.
+Out of scope: search, text extraction, classification and anything else
+derived from the disclosures. Those belong in the programs that consume the
+mirror.
 
-## A well-behaved guest
+## The API
 
-The mirror is a guest of the exchange's website and is built to act like one:
+The contract is the set of `.proto` files in
+[`contracts/`](contracts/newsweb/proto/com/vizroy/xosl/newsweb/v1), package
+`com.vizroy.xosl.newsweb.v1`.
 
-- It contacts NewsWeb only when you switch that on.
+One service, `NewswebService`:
+
+| Call | What it does |
+|---|---|
+| `ListDisclosures` | Streams the disclosures in a time range, for chosen tickers, newest first. |
+| `GetDisclosure` | Returns one disclosure by its NewsWeb message id, the number in its address. |
+| `ReadAttachment` | Streams an attachment's bytes. |
+| `WatchEvents` | Replays what changed since a point the caller names, then follows new events live. |
+
+Any gRPC client can be generated from those files. The Rust code generated
+from them is committed under `src/gen`.
+
+## Load on the exchange
+
+The mirror reads a public website that publishes no rate limit, so its
+defaults keep the load low:
+
+- Ingest is off until you enable it; until then it sends NewsWeb no request.
 - Requests are rate-limited, one per second by default.
 - A new mirror fetches the last few days. The full history is hundreds of
   thousands of disclosures and several hundred gigabytes of attachments, and
   has to be asked for.
-- It identifies itself honestly in its `User-Agent`.
+- Every request carries a `User-Agent` that names `xosl-newsweb` and its
+  version.
 - The repository ships code and never data. What you mirror is yours to keep
   within NewsWeb's terms of use, which you should read: they govern what you
   may do with the content.
@@ -70,7 +91,8 @@ The mirror is a guest of the exchange's website and is built to act like one:
 2. Inside it, run the checks or build the binary:
 
    ```
-   just check     # format, clippy, tests: what every pull request must pass
+   just check     # format, clippy, buf lint, tests: what every pull request must pass
+   just gen       # regenerate the Rust code after changing a .proto file
    just build     # the release binary, in target/release/
    ```
 

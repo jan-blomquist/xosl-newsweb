@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package com.vizroy.xosl.newsweb.v1;
+
+import "com/vizroy/xosl/newsweb/v1/model.proto";
+
+// One entry in the mirror's log of what changed. A consumer keeps the `seq`
+// of the last event it handled and resumes after it.
+message Event {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    // A disclosure read in full for the first time. A disclosure known only
+    // from the exchange's list has no event yet.
+    KIND_DISCOVERED = 1;
+    // The exchange changed a disclosure after it was discovered. Rare.
+    KIND_REVISED = 2;
+    // Another disclosure now corrects this one: `disclosure` is the corrected
+    // one, with `corrected_by_message_id` naming its correction. Written once both
+    // are in the mirror, whichever arrived first.
+    KIND_CORRECTED = 3;
+    KIND_ATTACHMENT_STORED = 4;
+    KIND_ATTACHMENT_FAILED = 5;
+  }
+
+  // Increases with every event; never reused.
+  int64 seq = 1;
+  Kind kind = 2;
+  // When the mirror wrote the event.
+  int64 at_ns = 3;
+  // The disclosure as it stood when the event was written.
+  Disclosure disclosure = 4;
+  // Set on the attachment kinds: the id of the attachment the event is
+  // about, within `disclosure`.
+  int64 attachment_id = 5;
+}

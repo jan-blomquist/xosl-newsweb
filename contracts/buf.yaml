@@ -1,0 +1,11 @@
+# The buf workspace of the gRPC contract: one module, STANDARD lint with no
+# exceptions, and no breaking change within a file once a version is released.
+version: v2
+modules:
+  - path: newsweb/proto
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE
