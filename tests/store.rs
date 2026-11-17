@@ -1676,3 +1676,35 @@ async fn set_delivery_position__other_name__leaves_the_first_unchanged() {
 
     assert_eq!(store.delivery_position("webhook").await.unwrap(), Some(7));
 }
+
+// A database file, since concurrent connections need one: the in-memory store
+// has a single connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn store_message__while_other_jobs_write__never_fails_with_database_is_locked() {
+    let folder = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(
+        Store::open(&folder.path().join("mirror.sqlite"))
+            .await
+            .unwrap(),
+    );
+    const WRITERS: i64 = 4;
+    const WRITES: i64 = 25;
+
+    let writers: Vec<_> = (0..WRITERS)
+        .map(|writer| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                for write in 0..WRITES {
+                    let message = message(1 + writer * WRITES + write);
+                    store.store_list_entry(&listed(&message), 1).await?;
+                    store.store_message(&full(&message), 2).await?;
+                }
+                Ok::<(), xosl_newsweb::store::StoreError>(())
+            })
+        })
+        .collect();
+
+    for writer in writers {
+        writer.await.unwrap().unwrap();
+    }
+}
