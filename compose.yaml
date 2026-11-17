@@ -6,7 +6,7 @@
 # `docker compose ps` shows the result.
 services:
   xosl-newsweb:
-    image: ghcr.io/jan-blomquist/xosl-newsweb:0.1.0
+    image: ghcr.io/jan-blomquist/xosl-newsweb:0.1.1
     restart: unless-stopped
     # The owner of ./data on the host. Without this line the service runs as
     # user 65532, and ./data has to belong to that user.

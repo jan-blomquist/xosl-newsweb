@@ -1,7 +1,7 @@
 [package]
 name = "xosl-newsweb"
 description = "Self-hosted mirror of Oslo Børs NewsWeb: company disclosures and their attachments, served over gRPC. Unofficial."
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/jan-blomquist/xosl-newsweb"

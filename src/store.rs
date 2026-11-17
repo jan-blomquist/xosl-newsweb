@@ -19,7 +19,7 @@ use std::time::Duration;
 use jiff::civil::Date;
 use prost::Message;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{SqliteConnection, SqlitePool};
+use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
 use tokio::sync::watch;
 
 use crate::exchange::{self, DecodeError, Fetched};
@@ -60,6 +60,11 @@ pub enum StoreError {
 /// Permanent failures after which a disclosure or an attachment is not
 /// requested again.
 pub const MAX_PERMANENT_FAILURES: u32 = 3;
+
+/// How long a write waits for SQLite's write lock while another job holds
+/// it. SQLite's default of 5 seconds is too short on a slow disk, where one
+/// commit can take more than a second and several jobs wait in turn.
+const WRITE_LOCK_WAIT: Duration = Duration::from_secs(30);
 
 /// How long a caller of an in-memory store waits for its one connection.
 const IN_MEMORY_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(365 * 86_400);
@@ -245,6 +250,7 @@ impl Store {
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(WRITE_LOCK_WAIT)
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new().connect_with(options).await?;
         Self::migrated(pool).await
@@ -273,6 +279,15 @@ impl Store {
             .connect_with(options)
             .await?;
         Self::migrated(pool).await
+    }
+
+    /// Starts a transaction that writes. It takes SQLite's write lock at
+    /// once, waiting its turn behind the other jobs. A transaction that
+    /// started by reading and asked for the lock at its first write would
+    /// fail with "database is locked" whenever another job had committed in
+    /// between.
+    async fn begin_write(&self) -> Result<Transaction<'static, Sqlite>, StoreError> {
+        Ok(self.pool.begin_with("BEGIN IMMEDIATE").await?)
     }
 
     async fn migrated(pool: SqlitePool) -> Result<Self, StoreError> {
@@ -312,7 +327,7 @@ impl Store {
     /// `CORRECTED` for that one. Returns
     /// whether the disclosure was new to the store.
     pub async fn store_list_entry(&self, entry: &Fetched, now_ns: i64) -> Result<bool, StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let inserted = insert_disclosure(&mut tx, entry, false, now_ns).await?;
         let mut written = None;
         if inserted {
@@ -348,7 +363,7 @@ impl Store {
     /// `unread_disclosures`, and its earlier failures no longer count.
     pub async fn store_message(&self, message: &Fetched, now_ns: i64) -> Result<(), StoreError> {
         let message_id = message.disclosure.message_id;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
 
         let stored: Option<StoredDocument> =
             sqlx::query_as("SELECT read_in_full, document FROM disclosures WHERE message_id = ?")
@@ -462,7 +477,7 @@ impl Store {
         failure: &Failure,
         now_ns: i64,
     ) -> Result<Retry, StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let counts: Option<DisclosureRetryCounts> = sqlx::query_as(
             "SELECT failed, attempts, transient_failures FROM disclosures WHERE message_id = ?",
         )
@@ -512,7 +527,7 @@ impl Store {
         failure: &Failure,
         now_ns: i64,
     ) -> Result<Retry, StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let counts: Option<AttachmentRetryCounts> = sqlx::query_as(
             "SELECT state, attempts, transient_failures FROM attachments
               WHERE message_id = ? AND attachment_id = ?",
@@ -682,7 +697,7 @@ impl Store {
         file: &StoredFile,
         now_ns: i64,
     ) -> Result<(), StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let updated = sqlx::query(
             "UPDATE attachments SET state = ?, content_type = ?, size_bytes = ?, sha256 = ?
              WHERE message_id = ? AND attachment_id = ?",
@@ -716,7 +731,7 @@ impl Store {
         attachment_id: i64,
         now_ns: i64,
     ) -> Result<(), StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let written = set_attachment_failed(&mut tx, message_id, attachment_id, now_ns).await?;
         tx.commit().await?;
         self.announce(written);
